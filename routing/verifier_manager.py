@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """ISE-Flow 多维成本核算与异构验证器管理模块.
 
-升级版：新增 `HumanEvalPlusVerifier`，支持在安全线程沙箱中，物理执行 LLM
-生成的 Python 函数并核对 HumanEval 官方断言。
+学术升级版：
+1. 强化了本地 HumanEvalPlusVerifier 的隔离沙箱，注入了完整的标准计算和 typing 命名空间，防止第三方测试断言 NameError。
+2. 保持对官方 evalplus 子进程评测的无缝兼容。
 """
 
 import sys
@@ -11,10 +12,14 @@ import time
 import logging
 import traceback
 import threading
-from typing import List, Dict, Any, Tuple, Optional, Set
+import re
+import collections
+import heapq
+import itertools
+from typing import List, Dict, Any, Tuple, Optional, Set, Union, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 import numpy as np
-import re
+
 logger = logging.getLogger("ise_flow.routing.verifier")
 
 
@@ -65,6 +70,7 @@ class HumanEvalPlusVerifier(BaseVerifier):
 
         def _sandbox_run():
             try:
+                # 注入高度健壮的运行命名空间，包含全部 typing 标注及常用计算标准库，规避 NameError
                 sandbox_globals = {
                     "__builtins__": __builtins__,
                     "math": __import__("math"),
@@ -73,18 +79,28 @@ class HumanEvalPlusVerifier(BaseVerifier):
                     "Dict": Dict,
                     "Tuple": Tuple,
                     "Optional": Optional,
-                    "Set": Set
+                    "Set": Set,
+                    "Any": Any,
+                    "Union": Union,
+                    "Callable": Callable,
+                    "Iterable": Iterable,
+                    "Sequence": Sequence,
+                    "collections": collections,
+                    "re": re,
+                    "heapq": heapq,
+                    "itertools": itertools,
+                    "typing": sys.modules["typing"]
                 }
                 exec(full_execution_script, sandbox_globals)
                 
-                # 【核心修复点】寻找 candidate 并执行参数化 check(candidate_fn) 调用
+                # 寻找 candidate 并执行参数化 check(candidate_fn) 调用
                 if "check" in sandbox_globals:
                     check_fn = sandbox_globals["check"]
                     if entry_point in sandbox_globals:
                         candidate_fn = sandbox_globals[entry_point]
                         check_fn(candidate_fn)  # 严格对齐官方评测
                     else:
-                        # 兜底：如果找不到对应的入口函数名，寻找除 check 以外的 callable 进行测试
+                        # 兜底：如果找不到对应的入口函数名，寻找除 check 以外的可执行单元进行测试
                         fallback_fn = None
                         for k, v in sandbox_globals.items():
                             if callable(v) and k != "check" and k != "Set":

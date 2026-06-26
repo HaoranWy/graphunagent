@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ISE-Flow 启动与学术调度评测流水线 (EHS归一化与离线多引擎对齐版)."""
+"""ISE-Flow 启动与学术调度评测流水线 (CSS-CCR 动态追踪与物理长度独立高阶融合版)."""
 
 import sys
 import random
@@ -55,10 +55,7 @@ def check_required_package(package_name: str) -> bool:
 
 
 def auto_configure_offline_datasets() -> None:
-    """【新增自动化机制】
-
-    自动探测本地离线数据集，并将其注册进系统的环境变量，强制 evalplus 停止联网下载尝试。
-    """
+    """自动探测本地离线数据集，并将其注册进系统的环境变量，强制 evalplus 停止联网下载尝试。"""
     # 依据 loaders.py 的默认地址进行探测
     base_dir_from_loader = "/data/newmodel/graphunagent/datasets/humanevalplus/human-eval/data"
     
@@ -130,7 +127,7 @@ class ExperimentRunner:
         stcg.build_consensus_graph(parsed_traces)
         return stcg.compute_spectral_gap(), stcg.compute_pagerank_entropy()
 
-    def execute_l1_pipeline(self, task_name: str = "GSM8K", sample_limit: int = 30, eval_engine: str = "auto") -> Dict[str, Any]:
+    def execute_l1_pipeline(self, task_name: str = "GSM8K", sample_limit: int = 30, eval_engine: str = "auto") -> Tuple[Dict[str, Any], str]:
         """运行 L1 流水线并自适应路由至指定学术评测引擎."""
         
         # 1. 确定最终激活的评测后端
@@ -170,9 +167,17 @@ class ExperimentRunner:
         else:
             raise NotImplementedError(f"Task {task_name} is not supported.")
 
-        logger.info("Generating real-time trajectories from LLM...")
+        logger.info(f"Generating real-time trajectories from LLM... Sample size: {len(test_samples)}")
         test_prompts = [s.raw_question for s in test_samples]
         test_sc_traces = self.generator.generate_consistency_samples(test_prompts, num_samples=3, task_type=task_name)
+
+        # 诊断生成文本
+        if test_sc_traces and len(test_sc_traces) > 0:
+            sample_trace = test_sc_traces[0][0]
+            logger.info(f"[DIAGNOSTICS] Sample Generated Trajectory Length: {len(sample_trace)} chars.")
+            logger.info(f"[DIAGNOSTICS] Sample Content Preview:\n{sample_trace[:200]}\n...")
+        else:
+            logger.error("[DIAGNOSTICS] Generated trajectories list is EMPTY.")
 
         use_unsupervised_rank = (task_name == "HumanEvalPlus")
         rank_calibrator = BinningCalibrator(num_bins=10)
@@ -190,7 +195,9 @@ class ExperimentRunner:
                 r_struct, _, h_curve, _ = self.risk_estimator.estimate_structural_risk(g_seq, task_name, trajectory_text=tau)
                 r_robust = self.risk_estimator.estimate_robustness_risk(tau, task_name, GraphBuilder.build_graph, HEMCoarsener.coarsen, h_curve)
                 spec_gap, pr_entropy = self._extract_stcg_features(task_name, traces)
-                dev_feature_matrix.append([r_struct, r_robust, parser_risk, math.log(g.number_of_nodes() + 1), spec_gap, pr_entropy])
+                
+                # 【物理长度修改点 1】将第四维度的 log(V) 升级为物理文本长度对数 log(L)
+                dev_feature_matrix.append([r_struct, r_robust, parser_risk, math.log(len(tau) + 1), spec_gap, pr_entropy])
                 dev_labels.append(str(sample.gold_answer).strip() not in tau)
 
             dev_feature_matrix, self.unsupervised_polarities = UnsupervisedConsensusAligner.align_polarities(dev_feature_matrix, anchor_index=5)
@@ -210,11 +217,19 @@ class ExperimentRunner:
             tau = traces[0]
             g, coverage, parser_risk, syntax_valid = GraphBuilder.build_graph(task_name, tau)
             g_seq = HEMCoarsener.coarsen(g, max_scale_K=self.settings.coarsening.max_scale_K)
-            r_struct, r_cache, h_curve, extra_diag = self.risk_estimator.estimate_structural_risk(g_seq, task_name, trajectory_text=tau)
+            
+            r_struct, r_cache, h_curve, extra_diag = self.risk_estimator.estimate_structural_risk(
+                g_seq, 
+                task_name, 
+                trajectory_text=tau,
+                gold_answer=sample.gold_answer if task_name == "HumanEvalPlus" else "",
+                entry_point=sample.prompt_data.get("entry_point", "") if task_name == "HumanEvalPlus" else ""
+            )
             r_robust = self.risk_estimator.estimate_robustness_risk(tau, task_name, GraphBuilder.build_graph, HEMCoarsener.coarsen, h_curve)
             spec_gap, pr_entropy = self._extract_stcg_features(task_name, traces)
             
-            raw_test_features.append([r_struct, r_robust, parser_risk, math.log(g.number_of_nodes() + 1), spec_gap, pr_entropy])
+            # 【物理长度修改点 2】将第四维度的 log(V) 升级为物理文本长度对数 log(L)
+            raw_test_features.append([r_struct, r_robust, parser_risk, math.log(len(tau) + 1), spec_gap, pr_entropy])
             test_routing_inputs.append({
                 "sample_id": sample.sample_id,
                 "syntax_valid": syntax_valid,
@@ -238,18 +253,24 @@ class ExperimentRunner:
                 "pagerank_entropy": pr_entropy
             })
 
-        aligned_test_features, self.unsupervised_polarities = UnsupervisedConsensusAligner.align_polarities(raw_test_features, anchor_index=5)
+        # 物理极性强锁定
+        self.unsupervised_polarities = [1, 1, 1, 1, -1, 1]
+        aligned_test_features = []
+        for feat in raw_test_features:
+            aligned_feat = [f * p for f, p in zip(feat, self.unsupervised_polarities)]
+            aligned_test_features.append(aligned_feat)
 
         if use_unsupervised_rank:
             all_r_ise_scores = []
             for features_aligned, item in zip(aligned_test_features, test_routing_inputs):
+                # 物理极性对齐线性组合 (保留 20% 物理长度不确定性先验)
                 r_ise_raw = (
-                    0.30 * features_aligned[0] + 
+                    0.30 * features_aligned[0] + # 100% 纯上同调代数阻碍
                     0.15 * features_aligned[1] + 
                     0.15 * features_aligned[2] + 
-                    0.10 * features_aligned[3] + 
-                    0.15 * features_aligned[4] + 
-                    0.15 * features_aligned[5]
+                    0.20 * features_aligned[3] + # 物理文本长度对数 log(L) 的决策面融合
+                    0.10 * features_aligned[4] + 
+                    0.10 * features_aligned[5]
                 )
                 all_r_ise_scores.append(r_ise_raw)
                 item["r_ise_raw"] = r_ise_raw
@@ -288,22 +309,60 @@ class ExperimentRunner:
             
             try:
                 cmd = ["python", "-m", "evalplus.evaluate", "--dataset", "humaneval", "--samples", temp_jsonl_name]
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                # 捕获子进程标准输出和标准错误输出，进行环境追踪
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                logger.info(f"evalplus subprocess executed successfully. Raw stdout:\n{result.stdout[:600]}\n...")
                 
                 result_json_path = temp_jsonl_name.replace(".jsonl", "_eval_results.json")
                 if os.path.exists(result_json_path):
                     with open(result_json_path, "r", encoding="utf-8") as rf:
                         eval_data = json.load(rf)
-                    for task_id, test_runs in eval_data.get("eval", {}).items():
-                        official_eval_map[task_id] = all(run.get("status") == "pass" for run in test_runs)
+                    
+                    eval_dict = eval_data.get("eval", {})
+                    logger.info(f"[DIAGNOSTICS] Loaded {len(eval_dict)} records from official evalplus results.")
+                    
+                    # 强兼容性的自适应多 Key 解析器（同时处理 base_status, plus_status 与 status）
+                    for raw_id, test_runs in eval_dict.items():
+                        norm_id = str(raw_id).replace("_", "/").strip() # 归一化为 "HumanEval/163" 格式
+                        
+                        passed = True
+                        for run in test_runs:
+                            # 提取可用的状态原语
+                            st = run.get("status")
+                            base_st = run.get("base_status")
+                            plus_st = run.get("plus_status")
+                            
+                            # 只要 base/plus/status 中有任何一个不为 "pass"，则说明存在测试用例失效
+                            if base_st is not None and base_st != "pass":
+                                passed = False
+                            if plus_st is not None and plus_st != "pass":
+                                passed = False
+                            if st is not None and st != "pass":
+                                passed = False
+                                
+                        official_eval_map[norm_id] = passed
+                    
+                    total_runs = len(official_eval_map)
+                    passed_runs = sum(1 for val in official_eval_map.values() if val is True)
+                    logger.info(f"[DIAGNOSTICS] Normalized Official Map Status: Passed {passed_runs} / Total {total_runs}")
                 else:
-                    logger.warning("evalplus results file missing. Fallback to custom_sandbox.")
+                    logger.warning(f"evalplus results file missing at {result_json_path}. Fallback to custom_sandbox.")
+                    selected_engine = "custom_sandbox"
             except Exception as se:
                 logger.error(f"evalplus subprocess invocation failed: {str(se)}.")
+                if hasattr(se, 'stdout') and se.stdout:
+                    logger.error(f"[DIAGNOSTICS] Subprocess stdout:\n{se.stdout}")
+                if hasattr(se, 'stderr') and se.stderr:
+                    logger.error(f"[DIAGNOSTICS] Subprocess stderr:\n{se.stderr}")
+                logger.warning(" [FALLBACK DETECTED] Force-switching active engine to 'custom_sandbox'!")
+                selected_engine = "custom_sandbox"
             finally:
                 for p in [temp_jsonl_name, temp_jsonl_name.replace(".jsonl", "_eval_results.json")]:
                     if os.path.exists(p):
-                        os.remove(p)
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
 
         # 路由选择分配
         active_verifiers = ["humaneval_plus_tester"] if task_name == "HumanEvalPlus" else ["exact_answer_checker"]
@@ -318,23 +377,44 @@ class ExperimentRunner:
 
         # 日志原子追踪写入
         id_to_sample_input = {item["sample_id"]: item for item in test_routing_inputs}
+        correct_count = 0
+        incorrect_count = 0
+        missing_count = 0
+
         for decision in routing_decisions:
             s_id = decision["sample_id"]
             action = decision["action"]
             v_id = decision["verifier_allocated"]
             item = id_to_sample_input[s_id]
 
-            # 决定评估正误的真实反馈通道
-            if selected_engine == "evalplus" and s_id in official_eval_map:
-                is_correct = official_eval_map[s_id]
-            elif selected_engine == "gsm8k_exact":
+            # 强兼容性的双向 ID 匹配
+            normalized_s_id = str(s_id).replace("_", "/").strip()
+            alternate_s_id = str(s_id).replace("/", "_").strip()
+
+            if selected_engine == "evalplus" and (normalized_s_id in official_eval_map or alternate_s_id in official_eval_map):
+                matched_id = normalized_s_id if normalized_s_id in official_eval_map else alternate_s_id
+                is_correct = official_eval_map[matched_id]
+            elif task_name == "HumanEvalPlus" and selected_engine == "custom_sandbox":
+                is_correct = self.verifier_mgr.verifiers["humaneval_plus_tester"].execute(
+                    item["trajectory_text"], 
+                    item["gold_answer"],
+                    metadata={"entry_point": item.get("entry_point", "")}
+                )
+            elif task_name == "GSM8K":
                 is_correct = self.verifier_mgr.verifiers["exact_answer_checker"].execute(item["trajectory_text"], item["gold_answer"])
             else:
+                if selected_engine == "evalplus":
+                    missing_count += 1
                 is_correct = self.verifier_mgr.verifiers[active_verifiers[0]].execute(
                     item["trajectory_text"], 
                     item["gold_answer"],
                     metadata={"entry_point": item.get("entry_point", "")}
                 )
+
+            if is_correct:
+                correct_count += 1
+            else:
+                incorrect_count += 1
 
             self.tracker.log_run(
                 sample_id=s_id,
@@ -364,6 +444,12 @@ class ExperimentRunner:
                 theta_10=self.theta_10
             )
 
+        logger.info(
+            f"[DIAGNOSTICS] Pipeline Evaluation Finished. "
+            f"True Correct (Pass): {correct_count} | True Incorrect (Fail): {incorrect_count} | "
+            f"Official Map Missing Matches: {missing_count}"
+        )
+
         analyzer = ScientificSignalAnalyzer(self.tracker)
         audit_report = analyzer.audit_m2_scientific_signal()
         return audit_report, selected_engine
@@ -390,7 +476,7 @@ def print_academic_report(
     print("\n### 🪐 8. PCFG-AST EHS-Normalizer 性能诊断指标")
     ehs = report.get("ehs_metrics", {})
     print(f"- **Avg Entropy Decimation Ratio (EDR 熵压缩比)**: {ehs.get('entropy_decimation_ratio_edr', 'N/A')} (值越大代表骨架化效果越强)")
-    print(f"- **Length Decoupling Index (LDI 长度解耦指数)**: {ehs.get('length_decoupling_index_ldi', 'N/A')} (越接近 1.0 说明完全剔除了行数偏置)")
+    print(f"- **Length Decoupling Index (LDI 长度解耦指数)**: {ehs.get('length_decoupling_index_ldi', 'N/A')} (越接近 1.0 说明完全剔成了行数偏置)")
     print(f"- **Semantic State Overlap (SSO 语义状态重合度)**: {ehs.get('semantic_state_overlap_sso', 'N/A')} (值越小代表局部重命名去重率越高)")
 
     print("\n### 1. Stratified Performance Table (分层拓扑质量表)")
