@@ -2,7 +2,9 @@ ise_flow/
 ├── config/
 │   ├── schemas.py           # 拓扑约束器：严格规范异构有向图节点 (STEP, CLAIM, ANSWER...) 与边 (SEQUENCE, SUPPORT...) 的合法连接Schema
 │   └── settings.py          # 参数配置总线：托管多维成本向量权重、HEM 粗粒化、Null-cache 分桶及物理预算限制
-│
+├── llm/
+│   ├── generator.py         # 并发生成：基于线程池高并发调度 vLLM，支持任务类型动态 System Prompt 分流
+│   └── prompts.py           # 模板库：提供可高精度正则解析的结构化 CoT 指令与 Python 规范
 ├── data/
 │   ├── loaders.py           # 数据加载器：支持 GSM8K（Parquet）与 HumanEvalPlus（Parquet）测试集物理读取
 │   ├── parsers.py           # 归一化编译器：集成 EHS-Normalizer 骨架收缩器，完成变量作用域重命名与线性控制流折叠
@@ -28,3 +30,5 @@ ise_flow/
 │   └── run_exp.py           # 实验调度与编排总线：协调 Dev 标定拟合、Test 测试路由及 Tracker 落地全闭环
 │
 └── run_pipeline.py          # 启动主程序：自动离线数据集环境绑定，支持 evalplus 子进程多 Key 兼容解析与自适应降级
+
+
