@@ -1,34 +1,29 @@
 ise_flow/
 ├── config/
-│   ├── schemas.py           # 拓扑约束器：严格规范异构有向图节点 (STEP, CLAIM, ANSWER...) 与边 (SEQUENCE, SUPPORT...) 的合法连接Schema
-│   └── settings.py          # 参数配置总线：托管多维成本向量权重、HEM 粗粒化、Null-cache 分桶及物理预算限制
-├── llm/
-│   ├── generator.py         # 并发生成：基于线程池高并发调度 vLLM，支持任务类型动态 System Prompt 分流
-│   └── prompts.py           # 模板库：提供可高精度正则解析的结构化 CoT 指令与 Python 规范
+│   ├── schemas.py           # 拓扑常数声明：仅定义极简的 TOKEN 节点与 ATTENTION 边符号。
+│   └── settings.py          # 配置总线：彻底剥离 coarsening 与 cache 配置，管理多维物理成本预算。
+│
 ├── data/
-│   ├── loaders.py           # 数据加载器：支持 GSM8K（Parquet）与 HumanEvalPlus（Parquet）测试集物理读取
-│   ├── parsers.py           # 归一化编译器：集成 EHS-Normalizer 骨架收缩器，完成变量作用域重命名与线性控制流折叠
-│   └── graph_builder.py     # 拓扑组装器：实现无监督二分符号投影图、高维 Python AST 代码图的构建
+│   ├── loaders.py           # 数据加载器：负责 GSM8K 与 HumanEval+ 数据集的本地 Parquet 物理读取。
+│   └── parsers.py           # 归一化编译器：集成 EHS-Normalizer 骨架化去噪器与数学答案 boxed 提纯。
 │
 ├── core/
-│   ├── stcg.py              # 谱共识引擎：重构为“层论多路径同伦相容性拼缝”算法，支持多路径算法多样性（STCG）
-│   ├── coarsening.py        # HEM 粗粒化器：执行带有词典序有序最大独立集匹配与超级节点属性合并
-│   ├── null_cache.py        # 零模型检索引擎：利用 MCMC PCFG-AST 树形产生式网格填充与全局 KNN-IDW 回归
-│   └── risk_estimator.py    # 拓扑风险编译引擎（核心）：实现“纯代数、参数无关的捷赫子空间投影层（CSS-CCR）”，自适应静态与动态测试流复形（DEC）
+│   ├── risk_estimator.py    # 信息几何风险评估引擎：实现 IJP 解析、LDAS 自适应自缩放谱隙求解、EPA 商空间同伦对齐与假设指标随动回传。[核心重构]
+│   └── stcg.py              # 谱共识引擎：多路径同伦谱共识特征对齐。
+│
+├── llm/
+│   ├── generator.py         # 并发生成端：支持高并发 vLLM 调用，原生配置 top_logprobs 导出单纯形本征分布。[核心重构]
+│   └── prompts.py           # 轨迹 Prompt 模板：定义高可解析性格式约束指令。
 │
 ├── routing/
-│   ├── calibration.py       # 标定器：非参数分桶校准器、KDE 弱监督噪声矩阵自抗扰标定器（RWSC）
-│   ├── verifier_manager.py  # 验证器沙箱：托管线程隔离的代码执行环境，注入了 typing/collections 等高阶库规避沙箱崩溃
-│   └── router.py            # 路由器：多维预算向量约束下，期望效用最大化（VCR）背包分配
+│   ├── calibration.py       # 变分标定器：RVSD 秩次极性对齐一维二分凸收敛寻根器，集成基于 MSO 均值的 OOD 自适应动态标定。[核心重构]
+│   ├── verifier_manager.py  # 验证器管理器：托管线程隔离执行沙箱（GSM8K 官方标准提纯、HumanEval+）。
+│   ├── router.py            # 成本路由器：执行多维资源预算边界检查与期望验证价值（EVV）背包路由。
+│   └── baselines.py         # 基线计算器：实现经过 CoT 去噪调整后的 NLL、SC、DeepConf 等对比算法。
 │
 ├── diagnostics/
-│   ├── tracker.py           # 运行时日志：原子化追加物理轨迹与分尺度高维度捷赫阻碍特征流至本地 JSONL
-│   ├── analyzer.py          # 指标审计：自适应统计 EDR, SSO, LDI, ECE, Brier Score 以及分层 AUROC 核心质量指标
-│   └── monitor.py           # 看板：编译生成端到端决策链追踪大面板
+│   ├── tracker.py           # 指标追踪器：原子化记录变分状态。
+│   ├── analyzer.py          # 指标审计器：实现在线计算 ECE、Brier Score 及同分平局鲁棒（Fractional Ranking）的标准 AUROC。
+│   └── monitor.py           # 看板生成器：编译生成决策链追踪仪表盘。
 │
-├── experiments/
-│   └── run_exp.py           # 实验调度与编排总线：协调 Dev 标定拟合、Test 测试路由及 Tracker 落地全闭环
-│
-└── run_pipeline.py          # 启动主程序：自动离线数据集环境绑定，支持 evalplus 子进程多 Key 兼容解析与自适应降级
-
-
+└── run_pipeline.py          # 启动主程序：整合单/多路径独立标定，集成本征信息几何诊断台与假设指标实证分析。[核心重构]

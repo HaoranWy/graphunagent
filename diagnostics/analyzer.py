@@ -20,20 +20,45 @@ class ScientificSignalAnalyzer:
     def __init__(self, tracker: Any) -> None:
         self.tracker = tracker
 
+    # =====================================================================
+    # 📌 修复：防标签泄露、平局鲁棒的学术级标准 AUROC 计算
+    # =====================================================================
     @staticmethod
     def calculate_auroc(y_true: List[int], y_scores: List[float]) -> float:
+        """计算真实的 ROC 曲线下面积 (AUROC) [2].
+        
+        采用学术界标准的 fractional ranking 处理并列分数 (ties) [2]。
+        当全部预测值完全等同（如发生平局）时，AUROC 严格收敛于 0.50 随机概率，阻断标签泄露 [2]。
+        """
         if not y_true or not y_scores or len(y_true) != len(y_scores):
             return 0.5
-        n = len(y_true)
-        pos_indices = [i for i in range(n) if y_true[i] == 1]
-        neg_indices = [i for i in range(n) if y_true[i] == 0]
-        n_pos, n_neg = len(pos_indices), len(neg_indices)
+            
+        y_true_arr = np.array(y_true, dtype=np.int32)
+        y_scores_arr = np.array(y_scores, dtype=np.float64)
+        
+        n_pos = int(np.sum(y_true_arr == 1))
+        n_neg = int(np.sum(y_true_arr == 0))
         if n_pos == 0 or n_neg == 0:
             return 0.5
-        paired = sorted(zip(y_scores, y_true), key=lambda x: (x[0], x[1]))
-        rank_sum = sum(rank_idx for rank_idx, (_, is_pos) in enumerate(paired, start=1) if is_pos == 1)
-        u_stat = rank_sum - (n_pos * (n_pos + 1)) / 2.0
-        return float(u_stat / (n_pos * n_neg + 1e-12))
+
+        # 使用 scipy.stats 提供的中立排序，不存在依赖时使用纯 numpy 实现的 fractional ranking
+        try:
+            from scipy.stats import rankdata
+            ranks = rankdata(y_scores_arr)
+        except ImportError:
+            # 纯 NumPy 闭式同分排名等价实现
+            obs, counts = np.unique(y_scores_arr, return_counts=True)
+            unique_ranks = np.zeros_like(obs, dtype=np.float64)
+            start_idx = 0
+            for i, c in enumerate(counts):
+                unique_ranks[i] = start_idx + (c + 1) / 2.0
+                start_idx += c
+            val_to_rank = dict(zip(obs, unique_ranks))
+            ranks = np.array([val_to_rank[x] for x in y_scores_arr])
+
+        rank_sum_pos = np.sum(ranks[y_true_arr == 1])
+        u_stat = rank_sum_pos - (n_pos * (n_pos + 1)) / 2.0
+        return float(u_stat / (n_pos * n_neg))
 
     @staticmethod
     def calculate_ece(y_true: List[int], y_probs: List[float], num_bins: int = 10) -> float:

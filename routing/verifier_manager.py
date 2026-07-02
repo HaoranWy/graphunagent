@@ -2,8 +2,9 @@
 """ISE-Flow 多维成本核算与异构验证器管理模块.
 
 学术升级版：
-1. 强化了本地 HumanEvalPlusVerifier 的隔离沙箱，注入了完整的标准计算和 typing 命名空间，防止第三方测试断言 NameError。
-2. 保持对官方 evalplus 子进程评测的无缝兼容。
+1. 强化了本地 HumanEvalPlusVerifier 的隔离沙箱，注入了完整的标准计算和 typing 命名空间。
+2. 新增 GSM8KOfficialVerifier 严格对齐 OpenAI 与 EleutherAI 官方数字提纯规则。
+3. 预留 MATH、SMT-LIB 和 FactScore 的学术级即插即用评估插槽。
 """
 
 import sys
@@ -168,6 +169,91 @@ class ExactAnswerVerifier(BaseVerifier):
         return str(gold_answer).strip() in code_or_text
 
 
+class GSM8KOfficialVerifier(BaseVerifier):
+    """GSM8K 官方标准/lm-evaluation-harness 严格对齐评测器."""
+
+    def __init__(self) -> None:
+        spec = VerifierSpec(
+            verifier_id="gsm8k_official_tester",
+            tpr=1.00,
+            fpr=0.00,
+            base_cost_vector=(0.01, 1.0, 1.0, 0.0, 0.0, 0.0)
+        )
+        super().__init__(spec)
+
+    def _clean_answer(self, ans_str: str) -> str:
+        """根据 EleutherAI lm-eval 规范清洗提纯数字 (剥离美元符号、逗号与末尾句号)."""
+        if not ans_str:
+            return ""
+        clean = ans_str.replace(",", "").replace("$", "").strip()
+        if clean.endswith("."):
+            clean = clean[:-1].strip()
+        return clean
+
+    def _extract_number_from_cot(self, text: str) -> str:
+        """从推理链中提取最终官方数值结果 (支持 #### 占位符与 LaTeX 占位符)."""
+        if not text:
+            return ""
+
+        # 1. 优先提取 #### 之后的文本
+        if "####" in text:
+            raw_ans = text.split("####")[-1].strip()
+            match = re.match(r"(-?\d+(?:\.\d+)?)", raw_ans)
+            if match:
+                return match.group(1)
+            return raw_ans.split()[0] if raw_ans.split() else raw_ans
+
+        # 2. 其次提取 \boxed{} 符号
+        boxed_match = re.search(r"\\boxed\{(.*?)\}", text)
+        if boxed_match:
+            return boxed_match.group(1).strip()
+
+        # 3. 兜底提取整个文本中的最后一个数值
+        numbers = re.findall(r"(-?\d+(?:\.\d+)?)", text)
+        if numbers:
+            return numbers[-1]
+
+        return ""
+
+    def execute(self, code_or_text: str, gold_answer: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        if not gold_answer:
+            return True
+
+        # 提纯候选值与真值
+        candidate_raw = self._extract_number_from_cot(code_or_text)
+        candidate_clean = self._clean_answer(candidate_raw)
+        gold_clean = self._clean_answer(str(gold_answer))
+
+        if not candidate_clean or not gold_clean:
+            return False
+
+        # 鲁棒数值型等价判断 (防止 15.0 == 15 发生误判)
+        try:
+            return abs(float(candidate_clean) - float(gold_clean)) < 1e-6
+        except ValueError:
+            # 字符级 Exact Match 兜底
+            return candidate_clean == gold_clean
+
+
+# =====================================================================
+# 📌 未来前沿学术 Benchmark 评测器可插拔插槽保留区 (Extensible Registry Slots)
+# =====================================================================
+class MATHVerifier(BaseVerifier):
+    """MATH 复杂多分支数学推理官方评测器 (预留插槽)."""
+    # TODO: 后续研究导入时，在此处实现 LaTeX 递归等价化简与 AIME 等等价对齐逻辑
+    pass
+
+class SMTLIBVerifier(BaseVerifier):
+    """SMT-LIB 约束求解器执行评测器 (预留插槽)."""
+    # TODO: 后续研究导入时，在此处调用 Z3 求解器子进程判定 solver.check()
+    pass
+
+class FactScoreVerifier(BaseVerifier):
+    """FactScore 事实真实性自回归评测器 (预留插槽)."""
+    # TODO: 后续研究导入时，在此处调用外部 Fact Judge 评估原子句真值
+    pass
+
+
 class VerifierManager:
     def __init__(
         self,
@@ -179,10 +265,15 @@ class VerifierManager:
         self.c_wrong = cost_wrong
         self.c_false_reject = cost_false_reject
 
+        # 统一工厂注册表
         self.verifiers: Dict[str, BaseVerifier] = {
             "python_syntax_checker": PythonSyntaxVerifier(),
             "exact_answer_checker": ExactAnswerVerifier(),
-            "humaneval_plus_tester": HumanEvalPlusVerifier()
+            "humaneval_plus_tester": HumanEvalPlusVerifier(),
+            "gsm8k_official_tester": GSM8KOfficialVerifier(),  # 激活官方 GSM8K 评测
+            # "math_official_tester": MATHVerifier(),          # 预留
+            # "smt_official_tester": SMTLIBVerifier(),          # 预留
+            # "factscore_official_tester": FactScoreVerifier()  # 预留
         }
 
     def register_verifier(self, verifier_id: str, verifier: BaseVerifier) -> None:

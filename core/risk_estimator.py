@@ -1,377 +1,281 @@
 # -*- coding: utf-8 -*-
-"""ISE-Flow 纯代数胞腔语义层评估模块 (捷赫子空间投影彻底解耦版)."""
+"""ISE-Flow 商空间对齐与本征共形路径作用量 (CSCF-EPA v2.0) 引擎.
+
+重构说明：
+1. 兼顾 Single-Path 与 Multi-Path 两种调用模式。
+2. 实现商空间投影与同伦路径对齐：仅对落入最大语义等价丛 C_maj 的路径计算几何积分，
+   并以系综共识比 (CCD) 进行共形非线性耦合，消融决策层面的错配。
+3. 随动回传 MSG, MSO, SBP, EAD_in, EAD_all 五大假设证明指标。
+"""
 
 import math
 import logging
-import re
-import sys
-from typing import List, Dict, Any, Tuple, Callable, Optional
+from typing import List, Dict, Any, Tuple, Optional
+from collections import Counter
 import numpy as np
-import networkx as nx
-
-from config.schemas import EdgeType
-from config.settings import RISEWeightsConfig
-from core.null_cache import NullCacheManager
 
 logger = logging.getLogger("ise_flow.core.risk_estimator")
 
 
-class DynamicTraceCollector:
-    """动态执行物理轨迹采集器."""
-
-    def __init__(self, target_func_name: str) -> None:
-        self.target_func_name = target_func_name
-        self.trace_steps: List[Tuple[int, Dict[str, float]]] = []
-
-    def trace_func(self, frame, event: str, arg: Any):
-        if event == 'line':
-            code = frame.f_code
-            func_name = code.co_name
-            if func_name == self.target_func_name:
-                # 捕获局部变量状态域，安全映射为浮点数标量
-                local_vars = {}
-                for k, v in frame.f_locals.items():
-                    if isinstance(v, (int, float, bool)):
-                        local_vars[k] = float(v)
-                    elif isinstance(v, (list, tuple, set)) and all(isinstance(x, (int, float)) for x in v):
-                        local_vars[k] = float(sum(v))
-                    else:
-                        local_vars[k] = float(hash(str(v)) % 1000) / 1000.0
-                self.trace_steps.append((frame.f_lineno, local_vars))
-        return self.trace_func
-
-
-class CellularSemanticsSheaf:
-    """纯代数、参数无关的胞腔语义层 (Čech Subspace Projection Sheaf).
+class IntrinsicConformalObserver:
+    """无参子词形态学投影器 (ICM).
     
-    采用层论中最严谨的伴随子空间投影定义：
-    - 0-胞腔 Stalk F(u) 的维度精确等于该节点所包含的变量、算子、数值等符号集基数 |S_u|。
-    - 局部截面 s(u) 存储当前步骤的实值语义状态。
-    - 限制映射 rho_u_e 定义为相交子空间的正交典范投影 (Canonical Projection)。
-    - 彻底消去随机矩阵 P、Q 与人工权重，实现真正的零参数层同论拼缝。
+    不引入任何外部随机投影矩阵与超参数，通过对 Token 字符进行无参形态学分解，
+    在词表空间中建立本征共形球面的黎曼测地距离。
     """
 
-    def __init__(self, G: nx.DiGraph, task_type: str) -> None:
-        """初始化捷赫投影语义层."""
-        self.G = G
-        self.task_type = task_type
-        # stalks[u] 存储形如 {var_name: valuation_float} 的局部语义状态格
-        self.stalks: Dict[str, Dict[str, float]] = {}
+    def __init__(self, dim: int = 128) -> None:
+        self.dim = dim
+        self.d_arr = np.arange(1, dim + 1, dtype=np.float64)
 
-    def _extract_local_valuations(self, text: str) -> Dict[str, float]:
-        """无监督、确定性地提取局部符号的实值语义不变式."""
-        valuations: Dict[str, float] = {}
-        if not text:
-            return valuations
+    def _to_char_ngrams(self, word: str, n_min: int = 2, n_max: int = 4) -> List[str]:
+        if not word:
+            return []
+        ngrams = []
+        word_padded = f"<{word}>"
+        for n in range(n_min, n_max + 1):
+            for i in range(len(word_padded) - n + 1):
+                ngrams.append(word_padded[i:i+n])
+        return ngrams
 
-        # 兼容匹配标准 EHS 标准变量 "v_depth_counter" (如 v_0_1) 与原生 "var_X"
-        var_pattern = re.compile(r"\b(?:v|var|step|line)_\d+(?:_\d+)?\b")
-        vars_found = var_pattern.findall(text)
-        for var in vars_found:
-            # 变量的初始状态由其名称哈希决定，保障确定性与无偏性
-            valuations[var] = float(hash(var) % 1000) / 1000.0
+    def get_embeddings(self, tokens: List[str]) -> np.ndarray:
+        T = len(tokens)
+        if T == 0:
+            return np.zeros((0, self.dim))
+        
+        embeds = []
+        for tok in tokens:
+            ngrams = self._to_char_ngrams(tok)
+            if not ngrams:
+                h = hash(tok)
+                tok_vector = np.sin(h * self.d_arr)
+            else:
+                hashes = np.array([hash(ngram) for ngram in ngrams], dtype=np.float64)
+                tok_vector = np.sum(np.sin(np.outer(hashes, self.d_arr)), axis=0)
+            embeds.append(tok_vector)
 
-        # 提取核心逻辑与代数算子（作为 Stalk 空间的逻辑不变量维度）
-        operators = re.findall(r"[\+\-\*/%&\|\^~=<>!]+", text)
-        for idx, op in enumerate(operators):
-            valuations[f"op_{idx}_{op}"] = 1.0
+        embeds_np = np.array(embeds, dtype=np.float64)
+        norms = np.linalg.norm(embeds_np, axis=1, keepdims=True) + 1e-8
+        return embeds_np / norms
 
-        # 提取具体常数数值
-        numbers = re.findall(r"\b\d+(?:\.\d+)?\b", text)
-        for idx, num in enumerate(numbers):
-            try:
-                valuations[f"num_{idx}"] = float(num)
-            except ValueError:
-                valuations[f"num_{idx}"] = 1.0
 
-        return valuations
+class FisherRaoCovariantPathAction:
+    """局域扩散谱阻碍与本征雅可比极化路径作用量变分计算器."""
 
-    def construct_sheaf_and_sections(self, trajectory_text: str) -> None:
-        """静态模态：构建 0-胞腔局部截面."""
-        for node_id, data in self.G.nodes(data=True):
-            payload = data.get("payload", {})
-            content = str(payload.get("content", "")) if payload else ""
-            if not content or content == "None":
-                content = node_id
-            self.stalks[node_id] = self._extract_local_valuations(content)
+    def __init__(self, logprobs: List[Dict[str, Any]], observer: IntrinsicConformalObserver, floor_logprob: float = -20.0, eta: float = 1.0) -> None:
+        self.logprobs = logprobs
+        self.T = len(logprobs)
+        self.floor = floor_logprob
+        self.eta = eta
+        self.observer = observer  # 共享全局观测器
 
-    def construct_dynamic_complex_sheaf(self, trace_steps: List[Tuple[int, Dict[str, float]]]) -> None:
-        """动态模态：物理执行轨迹的实值变量 Stalk 状态映射."""
-        self.stalks.clear()
-        for step_idx, (line_no, local_vars) in enumerate(trace_steps):
-            node_id = f"step_{step_idx}_line_{line_no}"
-            self.stalks[node_id] = {k: float(v) for k, v in local_vars.items()}
+    def _compute_local_spectral_dynamics(self, words: List[str], probs_t: np.ndarray) -> Tuple[float, float, float]:
+        """【假设 2 证明核】利用 Zelnik-Manor 局部自适应度规闭式求解局域谱隙与谱阻碍."""
+        K = len(words)
+        shannon_h = -np.sum(probs_t * np.log(probs_t + 1e-12))
+        
+        if K <= 2:
+            sbp = 1.0 / (shannon_h + 1e-12)
+            return 1.0, 0.0, float(sbp)
 
-    def compute_cech_cohomology_obstruction(self) -> float:
-        """计算第一上同调群 H^1 的捷赫共边界相容性阻碍 (捷赫子空间投影版)."""
-        edges = []
-        if self.G and self.G.edges:
-            edges = list(self.G.edges)
-        else:
-            # 动态轨迹基空间 1-胞腔边集合构造
-            nodes_sorted = sorted(list(self.stalks.keys()), key=lambda x: int(x.split("_")[1]) if "step_" in x else 0)
-            edges = [(nodes_sorted[i], nodes_sorted[i+1]) for i in range(len(nodes_sorted)-1)]
+        embeds = self.observer.get_embeddings(words)
+        S = np.clip(np.dot(embeds, embeds.T), -1.0, 1.0)
+        D = np.sqrt(np.clip(2.0 * (1.0 - S), 0.0, None))  # 本征共形球面距离
 
-        if not edges:
-            return 0.0
+        M = min(3, K - 1)
+        sigmas = np.zeros(K)
+        for i in range(K):
+            sorted_dists = np.sort(D[i])
+            sigmas[i] = sorted_dists[M] if sorted_dists[M] > 1e-6 else 1e-3
 
-        obstruction_norms = []
-        for u, v in edges:
-            s_u = self.stalks.get(u, {})
-            s_v = self.stalks.get(v, {})
+        W = np.zeros((K, K))
+        for i in range(K):
+            for j in range(K):
+                denom = sigmas[i] * sigmas[j]
+                W[i, j] = np.exp(- (D[i, j] ** 2) / denom)
+
+        P_diff = np.zeros((K, K))
+        for i in range(K):
+            row_weights = W[i] * probs_t
+            sum_row = np.sum(row_weights) + 1e-12
+            P_diff[i] = row_weights / sum_row
+
+        try:
+            eigvals = np.real(np.linalg.eigvals(P_diff))
+            eigvals = np.sort(eigvals)
+            lambda_2 = np.clip(eigvals[-2] if len(eigvals) >= 2 else 0.0, 0.0, 1.0)
             
-            # 1. 计算相交子空间支撑集 S_u \cap S_v
-            shared_vars = set(s_u.keys()).intersection(set(s_v.keys()))
-            
-            if not shared_vars:
-                # 没有任何逻辑/变量交集，代数胶合相容性平凡（Vacuously）成立，阻碍为 0.0
-                obstruction_norms.append(0.0)
+            spectral_gap = 1.0 - lambda_2
+            spectral_obstruction = lambda_2
+        except Exception:
+            spectral_gap = 1.0
+            spectral_obstruction = 0.0
+
+        sbp = spectral_gap / (shannon_h + 1e-12)
+        return float(spectral_gap), float(spectral_obstruction), float(sbp)
+
+    def compute_local_kinetic_energies(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """解析求解每一自回归生成步的多维几何动力学指标."""
+        if self.T <= 1:
+            return np.zeros(self.T), np.zeros(self.T), np.zeros(self.T), np.zeros(self.T), np.zeros(self.T)
+
+        K_raw = np.zeros(self.T)
+        H_polar = np.zeros(self.T)
+        Spec_Gap = np.zeros(self.T)
+        Spec_Obs = np.zeros(self.T)
+        SBP_list = np.zeros(self.T)
+
+        for t in range(1, self.T):
+            dist_t = self.logprobs[t].get("top_logprobs", {})
+            dist_prev = self.logprobs[t-1].get("top_logprobs", {})
+
+            words = list(dist_t.keys())
+            if not words:
                 continue
+
+            raw_logprobs_t = np.array([dist_t[w] for w in words])
+            probs_t = np.exp(raw_logprobs_t)
+            probs_t /= (np.sum(probs_t) + 1e-12)
+
+            s_gap, s_obs, sbp = self._compute_local_spectral_dynamics(words, probs_t)
+            Spec_Gap[t] = s_gap
+            Spec_Obs[t] = s_obs
+            SBP_list[t] = sbp
+
+            K_size = len(probs_t)
+            if K_size > 1:
+                J = np.diag(probs_t) - np.outer(probs_t, probs_t)
+                eigvals = np.linalg.eigvalsh(J)
+                eigvals = np.clip(eigvals, 0.0, None)
+                eigvals = np.sort(eigvals)
                 
-            # 2. 捷赫共边界计算 (d^0 s)_e = \rho_{v \to e}(s_v) - \rho_{u \to e}(s_u)
-            # 限制映射 \rho 直接由共享变量子空间的正交投影算子 P_e 决定，不存在任何物理调参参数
-            edge_ob_sum = 0.0
-            for var in shared_vars:
-                val_u = s_u[var]
-                val_v = s_v[var]
-                edge_ob_sum += (val_v - val_u) ** 2
+                non_zero_eigs = eigvals[1:]
+                trace_J = np.sum(non_zero_eigs)
                 
-            # 归一化该交集胞腔上的阻碍强度
-            obstruction_norms.append(edge_ob_sum / len(shared_vars))
-            
-        ccr_risk = float(np.mean(obstruction_norms))
-        return ccr_risk
+                if trace_J > 1e-6:
+                    norm_eigs = non_zero_eigs / trace_J
+                    H_polar[t] = -np.sum(norm_eigs * np.log(norm_eigs + 1e-12))
+                else:
+                    H_polar[t] = 0.0
+            else:
+                H_polar[t] = 0.0
+
+            log_p_prev = np.array([dist_prev.get(w, self.floor) for w in words])
+            velocities = raw_logprobs_t - log_p_prev
+            mean_v = np.sum(probs_t * velocities)
+            var_v = np.sum(probs_t * (velocities - mean_v) ** 2)
+            K_raw[t] = 0.5 * max(0.0, var_v)
+
+        return K_raw, H_polar, Spec_Gap, Spec_Obs, SBP_list
+
+    def compute_polarized_path_action(self) -> Tuple[float, float, float, float]:
+        """求解集成局域谱阻碍压制后的单路径作用量."""
+        K_raw, H_polar, Spec_Gap, Spec_Obs, SBP_list = self.compute_local_kinetic_energies()
+        if len(K_raw) <= 1:
+            return 0.0, 1.0, 0.0, 1.0
+        
+        K_polarized = K_raw * Spec_Obs * np.exp(self.eta * H_polar)
+        
+        avg_action = float(np.mean(K_polarized[1:]))
+        avg_gap = float(np.mean(Spec_Gap[1:]))
+        avg_obs = float(np.mean(Spec_Obs[1:]))
+        avg_sbp = float(np.mean(SBP_list[1:]))
+
+        return avg_action, avg_gap, avg_obs, avg_sbp
 
 
 class RiskEstimator:
-    """基于层同伦捷赫拼缝相容性的纯代数风险编译引擎."""
+    """基于本征谱阻碍与雅可比极化路径作用量的信息几何风险总线."""
 
-    def __init__(
-        self,
-        null_cache_mgr: NullCacheManager,
-        weights_config: RISEWeightsConfig,
-        omega_weights: Tuple[float, ...] = (0.3, 0.2, 0.3, 0.1, 0.1)
-    ) -> None:
-        self.cache_mgr = null_cache_mgr
+    def __init__(self, null_cache_mgr: Any = None, weights_config: Any = None) -> None:
         self.weights = weights_config
-        self.omega = omega_weights
-
-    @staticmethod
-    def calculate_effective_dimension(G: nx.DiGraph) -> float:
-        if G.number_of_nodes() <= 2:
-            return 1.0
-        U = G.to_undirected()
-        try:
-            if not nx.is_connected(U):
-                components = list(nx.connected_components(U))
-                if not components:
-                    return 1.0
-                largest_cc = U.subgraph(max(components, key=len))
-                v_size = largest_cc.number_of_nodes()
-                diameter = nx.diameter(largest_cc)
-            else:
-                v_size = G.number_of_nodes()
-                diameter = nx.diameter(U)
-            if diameter <= 1:
-                return 1.0
-            return float(math.log(v_size) / math.log(diameter + 1e-5))
-        except Exception:
-            return 1.0
-
-    def _extract_trace_from_assertion(self, trajectory_text: str, entry_point: str, gold_answer: str) -> List[Tuple[int, Dict[str, float]]]:
-        """物理追踪器：从 gold_answer 断言中剥离测试用例并在线执行，提取 DEC 轨迹."""
-        if not trajectory_text or not entry_point or not gold_answer:
-            return []
-
-        code_clean = trajectory_text
-        if "```python" in trajectory_text:
-            code_clean = trajectory_text.split("```python")[-1].split("```")[0].strip()
-
-        assertions = re.findall(r"assert\s+candidate\((.*?)\)", gold_answer)
-        if not assertions:
-            return []
-
-        test_args_str = assertions[0]
-
-        sandbox_globals = {
-            "__builtins__": __builtins__,
-            "math": __import__("math"),
-            "sys": sys,
-            "List": List,
-            "Dict": Dict,
-            "Tuple": Tuple,
-            "Optional": Optional,
-            "Set": Set
-        }
-
-        try:
-            exec(code_clean, sandbox_globals)
-            func_obj = sandbox_globals.get(entry_point)
-            if not func_obj or not callable(func_obj):
-                return []
-
-            collector = DynamicTraceCollector(entry_point)
-            sys.settrace(collector.trace_func)
-            try:
-                eval(f"{entry_point}({test_args_str})", sandbox_globals)
-            finally:
-                sys.settrace(None)
-
-            return collector.trace_steps
-        except Exception as e:
-            sys.settrace(None)
-            logger.debug(f"[DEC DIAGOSTICS] Trace run exception: {str(e)}")
-            return []
+        self.observer = IntrinsicConformalObserver()
 
     def estimate_structural_risk(
         self, 
-        G_sequence: List[nx.DiGraph], 
-        schema_name: str,
+        G_sequence: Any = None, 
+        schema_name: str = "GSM8K",
         trajectory_text: str = "",
         gold_answer: str = "",
-        entry_point: str = ""
+        entry_point: str = "",
+        logprobs: Optional[List[Dict[str, Any]]] = None,
+        attentions: Optional[np.ndarray] = None
     ) -> Tuple[float, float, List[float], Dict[str, Any]]:
-        """计算混合拓扑风险 (自适应静态/动态层选择)."""
-        if not G_sequence:
-            return 1.0, 1.0, [], {}
+        """【单路径模式接口】."""
+        if not logprobs:
+            return 0.5, 0.0, [0.5], {}
 
-        G_0 = G_sequence[0]
-        d_eff = self.calculate_effective_dimension(G_0)
+        fr_pa = FisherRaoCovariantPathAction(logprobs, observer=self.observer)
+        action_val, avg_gap, avg_obs, avg_sbp = fr_pa.compute_polarized_path_action()
+        K_raw, H_polar, Spec_Gap, Spec_Obs, SBP_list = fr_pa.compute_local_kinetic_energies()
+        K_polarized = K_raw * Spec_Obs * np.exp(fr_pa.eta * H_polar)
 
-        # -----------------------------------------------------------------
-        # 1. 胞腔语义层 Čech 拼缝阻碍计算 (自适应双模态检测)
-        # -----------------------------------------------------------------
-        is_code_task = (schema_name == "HumanEvalPlus" or schema_name == "Code")
-        trace_steps = []
-        
-        if is_code_task and gold_answer and entry_point:
-            trace_steps = self._extract_trace_from_assertion(trajectory_text, entry_point, gold_answer)
-
-        if trace_steps:
-            # [动态 DEC 模态]
-            dyn_sheaf = CellularSemanticsSheaf(None, schema_name)
-            dyn_sheaf.construct_dynamic_complex_sheaf(trace_steps)
-            raw_cohomology_risk = dyn_sheaf.compute_cech_cohomology_obstruction()
-            logger.info(f"[DEC ACTIVE] Čech dynamic complex obstruction calculated: {raw_cohomology_risk:.4f}")
-        else:
-            # [静态同伦层模态]
-            static_sheaf = CellularSemanticsSheaf(G_0, schema_name)
-            static_sheaf.construct_sheaf_and_sections(trajectory_text)
-            raw_cohomology_risk = static_sheaf.compute_cech_cohomology_obstruction()
-
-        # -----------------------------------------------------------------
-        # 2. 100% 纯净结构层上同调风险输出 (彻底解耦底层物理统计噪声)
-        # -----------------------------------------------------------------
-        purified_r_struct = float(np.clip(raw_cohomology_risk, 0.01, 0.99))
-
-        # 维持 diagnostics 报告总线的数据完整性
-        normalized_entropies: List[float] = []
-        raw_entropies: List[float] = []
-        null_means: List[float] = []
-        null_stds: List[float] = []
-        lookup_distances: List[float] = []
-        mcmc_fallback_count = 0
-        cache_statuses: List[str] = []
-
-        for G_k in G_sequence:
-            sheaf_k = CellularSemanticsSheaf(G_k, schema_name)
-            sheaf_k.construct_sheaf_and_sections(trajectory_text)
-            cech_norm_k = sheaf_k.compute_cech_cohomology_obstruction()
-            
-            mu_N, sigma_N, status, dist = self.cache_mgr.query_baseline(G_k, schema_name)
-            
-            sigma_N_safe = max(sigma_N, 0.1)
-            mu_N_safe = max(mu_N, 0.1)
-
-            normalized_h = (cech_norm_k - mu_N_safe) / (sigma_N_safe + 1e-5)
-            normalized_h_clipped = max(0.0, min(3.0, float(normalized_h)))
-            
-            normalized_entropies.append(normalized_h_clipped)
-            raw_entropies.append(float(cech_norm_k))
-            null_means.append(float(mu_N))
-            null_stds.append(float(sigma_N))
-            lookup_distances.append(float(dist))
-            cache_statuses.append(status)
-
-        extra_diagnostics = {
-            "raw_entropies": raw_entropies,
-            "null_means": null_means,
-            "null_stds": null_stds,
-            "lookup_distances": lookup_distances,
-            "mcmc_fallback_count": mcmc_fallback_count,
-            "cache_statuses": cache_statuses,
-            "effective_dimension": d_eff,
-            "rev_rates": [],
-            "raw_r_struct_unbiased": raw_cohomology_risk
+        return action_val, 0.0, K_polarized.tolist(), {
+            "raw_r_struct_unbiased": action_val,
+            "avg_edge_weight": avg_gap,
+            "fiedler_connectivity": avg_obs,
+            "attention_entropy": avg_sbp,
+            "action_variance": 0.0,
+            "consensus_ratio": 1.0,
+            "ead_in": 0.0
         }
 
-        return purified_r_struct, 0.0, normalized_entropies, extra_diagnostics
-
-    @classmethod
-    def apply_rule_perturbations(cls, text: str) -> List[str]:
-        if not text:
-            return []
-        perturbed_versions: List[str] = []
-        p_space = re.sub(r"(\s+)", r"\1  ", text)
-        perturbed_versions.append(p_space)
-        p_newline = text.replace("\n", "\n\n")
-        perturbed_versions.append(p_newline)
-        p_tab = text.replace("    ", "\t") if "    " in text else text.replace("\t", "    ")
-        perturbed_versions.append(p_tab)
-        p_bullet = text.replace("\n- ", "\n* ").replace("\n* ", "\n- ")
-        perturbed_versions.append(p_bullet)
-        return perturbed_versions
-
-    def estimate_robustness_risk(
+    def estimate_ensemble_risk(
         self,
-        raw_text: str,
-        task_type: str,
-        graph_build_fn: Callable[[str, str], Tuple[nx.DiGraph, float, float, int]],
-        coarsen_fn: Callable[[nx.DiGraph], List[nx.DiGraph]],
-        base_h_curve: List[float]
-    ) -> float:
-        if not raw_text or not base_h_curve:
-            return 1.0
-        perturbed_texts = self.apply_rule_perturbations(raw_text)
-        if not perturbed_texts:
-            return 1.0
-        phi_base = np.array(base_h_curve, dtype=np.float64)
-        phi_base_norm = np.linalg.norm(phi_base) + 1e-6
-        drift_sums = 0.0
+        logprobs_list: List[List[Dict[str, Any]]],
+        answers_list: List[str]
+    ) -> Tuple[float, Dict[str, Any]]:
+        """【假设 1 证明核：商空间投影与同伦路径对齐】.
+        
+        仅对落入最大语义丛 C_maj 的路径计算几何积分，彻底剥离不相干错误路径的线性污染。
+        同时输出全景离散度（EAD_out）与丛内离散度（EAD_in）用于严格理论实证。
+        """
+        if not logprobs_list:
+            return 0.5, {}
 
-        for p_text in perturbed_texts:
-            try:
-                g_p, _, _, _ = graph_build_fn(task_type, p_text)
-                g_p_seq = coarsen_fn(g_p)
-                
-                phi_p_list: List[float] = []
-                for G_k in g_p_seq:
-                    sheaf_p = CellularSemanticsSheaf(G_k, task_type)
-                    sheaf_p.construct_sheaf_and_sections(p_text)
-                    cech_p = sheaf_p.compute_cech_cohomology_obstruction()
-                    
-                    mu_N, _, _, _ = self.cache_mgr.query_baseline(G_k, task_type)
-                    phi_p_list.append(cech_p / (mu_N + 1e-6))
-                
-                phi_p = np.array(phi_p_list, dtype=np.float64)
-                if len(phi_p) < len(phi_base):
-                    phi_p = np.pad(phi_p, (0, len(phi_base) - len(phi_p)), "edge")
-                elif len(phi_p) > len(phi_base):
-                    phi_p = phi_p[:len(phi_base)]
-                l2_distance = np.linalg.norm(phi_base - phi_p)
-                drift_sums += (l2_distance / phi_base_norm)
-            except Exception:
-                drift_sums += 1.0
+        # 1. 商空间等价类划分，识别最大语义共识丛 C_maj
+        counter = Counter(answers_list)
+        voted_ans, maj_size = counter.most_common(1)[0]
+        N = len(logprobs_list)
+        consensus_ratio = float(maj_size / N)
+        
+        single_actions = []
+        gaps = []
+        obstractions = []
+        sbps = []
 
-        robust_coef = 1.0 - (drift_sums / len(perturbed_texts))
-        r_robust = 1.0 - max(0.0, min(1.0, robust_coef))
-        return float(r_robust)
+        # 2. 共享观测器并随动解算
+        for path_logprobs in logprobs_list:
+            fr_pa = FisherRaoCovariantPathAction(path_logprobs, observer=self.observer)
+            action_val, avg_gap, avg_obs, avg_sbp = fr_pa.compute_polarized_path_action()
+            single_actions.append(action_val)
+            gaps.append(avg_gap)
+            obstractions.append(avg_obs)
+            sbps.append(avg_sbp)
 
-    def compile_r_ise(self, r_struct: float, r_parse: float, r_robust: float, r_cache: float) -> float:
-        r_ise = (
-            self.weights.w_struct * r_struct +
-            self.weights.w_parse * r_parse +
-            self.weights.w_robust * r_robust +
-            self.weights.w_cache * r_cache
-        )
-        return float(max(0.0, r_ise))
+        # 3. 同伦路径对齐 (HPA)
+        # 仅对处于最大共识丛中的测地线进行局域作用量积分
+        maj_indices = [i for i, ans in enumerate(answers_list) if ans == voted_ans]
+        maj_actions = [single_actions[idx] for idx in maj_indices]
+        aligned_mean_action = float(np.mean(maj_actions))
+
+        # 4. 【假设 1 证明核】系综作用量离散度求解
+        # ead_out: 全景测地线离散度 (EAD_out)
+        ead_out = float(np.std(single_actions)) if len(single_actions) > 1 else 0.0
+        # ead_in: 丛内测地线离散度 (EAD_in) -> 证明正确路径收敛于轨道管
+        ead_in = float(np.std(maj_actions)) if len(maj_actions) > 1 else 0.0
+
+        # 5. EPA 极化耦合
+        epa_val = aligned_mean_action * np.exp(1.0 - consensus_ratio) + ead_out
+
+        extra_diagnostics = {
+            "raw_r_struct_unbiased": epa_val,
+            "avg_edge_weight": float(np.mean(gaps)),          # Mean MSG
+            "fiedler_connectivity": float(np.mean(obstractions)), # Mean MSO
+            "attention_entropy": float(np.mean(sbps)),        # Mean SBP
+            "action_variance": ead_out,                        # EAD_out (全景)
+            "ead_in": ead_in,                                  # EAD_in (丛内)
+            "consensus_ratio": consensus_ratio                 # CCD (共识丛密度)
+        }
+
+        return epa_val, extra_diagnostics
