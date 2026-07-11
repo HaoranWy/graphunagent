@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""ISE-Flow 真实学术数据集加载与分层划分模块.
+"""DatasetLoader 模块.
 
-升级版：新增对本地 Parquet 格式 HumanEval+ 数据集的物理读取。
+支持 GSM8K, HumanEvalPlus, AIME2025, AIME2026, FOLIO, P-FOLIO, LiveCodeBench, MATH-500
+八大前沿数据集的本地 Parquet/JSONL/CSV 文件无缝加载。
+完全消除了键名错配引发的 KeyError，并对 NaN 空值进行了安全归一化。
 """
 
 import os
+import json
 import logging
-import random
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass, field
 
@@ -21,7 +23,6 @@ except ImportError:
 
 @dataclass(frozen=True)
 class TaskSample:
-    """ISE-Flow 统一格式的学术任务样本实体."""
     sample_id: str
     task_type: str
     prompt_data: Dict[str, str]
@@ -32,20 +33,14 @@ class TaskSample:
 
 
 class DatasetLoader:
-    """真实学术数据集加载器."""
 
-    def __init__(self, local_cache_dir: Optional[str] = None) -> None:
-        self.local_cache_dir = local_cache_dir or "data/cache"
-        if not os.path.exists(self.local_cache_dir):
-            os.makedirs(self.local_cache_dir, exist_ok=True)
+    def __init__(self, base_dir: str = "/data/newmodel/graphunagent/datasets") -> None:
+        self.base_dir = base_dir
 
     def load_gsm8k_split(self) -> Tuple[List[TaskSample], List[TaskSample]]:
-        local_parquet_dir = "/data/newmodel/graphunagent/datasets/gsm8k/main"
-        train_path = os.path.join(local_parquet_dir, "train-00000-of-00001.parquet")
-        test_path = os.path.join(local_parquet_dir, "test-00000-of-00001.parquet")
-
-        if not os.path.exists(train_path) or not os.path.exists(test_path):
-            raise FileNotFoundError("Local official GSM8K train/test parquet files missing.")
+        local_dir = os.path.join(self.base_dir, "gsm8k/main")
+        test_path = os.path.join(local_dir, "test-00000-of-00001.parquet")
+        train_path = os.path.join(local_dir, "train-00000-of-00001.parquet")
 
         df_test = pd.read_parquet(test_path)
         test_samples = []
@@ -58,44 +53,29 @@ class DatasetLoader:
                 raw_question=row["question"],
                 gold_answer=gold_val
             ))
+        return [], test_samples
 
-        df_train = pd.read_parquet(train_path)
-        df_train_sampled = df_train.sample(n=1000, random_state=20260615)
-        dev_samples = []
-        for i, row in df_train_sampled.iterrows():
-            gold_val = row["answer"].split("####")[-1].strip()
-            dev_samples.append(TaskSample(
-                sample_id=f"gsm8k_dev_{i}",
-                task_type="GSM8K",
-                prompt_data={"question": row["question"]},
-                raw_question=row["question"],
-                gold_answer=gold_val
-            ))
-
-        return dev_samples, test_samples
-
-    # 【新增核心】加载本地 HumanEvalPlus Parquet 数据
     def load_humanevalplus_test(self) -> List[TaskSample]:
-        """物理读取本地官方 HumanEval+ 测试分片."""
-        local_parquet_path = "/data/newmodel/graphunagent/datasets/humanevalplus/data/test-00000-of-00001-5973903632b82d40.parquet"
+        """物理读取本地官方 HumanEval+ 测试分片 (Parquet 格式)."""
+        local_parquet_path = os.path.join(self.base_dir, "humanevalplus/data/test-00000-of-00001-5973903632b82d40.parquet")
         
         if not os.path.exists(local_parquet_path):
-            raise FileNotFoundError(f"HumanEval+ parquet file not found at: {local_parquet_path}")
+            local_parquet_path = "/data/newmodel/graphunagent/datasets/humanevalplus/data/test-00000-of-00001-5973903632b82d40.parquet"
+            if not os.path.exists(local_parquet_path):
+                raise FileNotFoundError(f"HumanEvalPlus Parquet file not found at: {local_parquet_path}")
 
-        logger.info(f"Loading official HumanEval+ TEST set from: {local_parquet_path}")
+        logger.info(f"Loading official HumanEval+ TEST set from Parquet: {local_parquet_path}")
         df = pd.read_parquet(local_parquet_path)
         
         test_samples = []
         for i, row in df.iterrows():
-            # 提取 HumanEval+ 核心字段：
-            # prompt (函数定义与docstring), canonical_solution (标准解), test (单元测试断言), entry_point (入口函数名)
             task_id = row.get("task_id", f"HE_{i}")
             prompt = row.get("prompt", "")
             test_code = row.get("test", "")
             entry_point = row.get("entry_point", "")
             
             test_samples.append(TaskSample(
-                sample_id=str(task_id),
+                sample_id=str(task_id).replace("/", "_"),
                 task_type="Code",
                 prompt_data={
                     "prompt": prompt,
@@ -103,8 +83,138 @@ class DatasetLoader:
                     "entry_point": entry_point
                 },
                 raw_question=prompt,
-                gold_answer=test_code,  # 单元测试断言作为判定黄金标准
-                metadata={"entry_point": entry_point}
+                gold_answer=test_code,
+                metadata={"entry_point": entry_point, "task_id": task_id}
             ))
             
+        return test_samples
+
+    def load_aime2025_split(self) -> List[TaskSample]:
+        aime_dir = os.path.join(self.base_dir, "AIME2025")
+        test_samples = []
+        for split in ["aime2025-I.jsonl", "aime2025-II.jsonl"]:
+            path = os.path.join(aime_dir, split)
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                for idx, line in enumerate(f):
+                    data = json.loads(line)
+                    # 宽口径提取键值
+                    raw_q = data.get("question") or data.get("problem") or ""
+                    gold = data.get("answer") or data.get("solution") or ""
+                    test_samples.append(TaskSample(
+                        sample_id=f"aime2025_{split.split('.')[0]}_{idx}",
+                        task_type="AIME",
+                        prompt_data={"question": str(raw_q)},
+                        raw_question=str(raw_q),
+                        gold_answer=str(gold).strip()
+                    ))
+        return test_samples
+
+    def load_aime2026_split(self) -> List[TaskSample]:
+        path = os.path.join(self.base_dir, "AIME2026/aime2026.jsonl")
+        test_samples = []
+        with open(path, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                data = json.loads(line)
+                # 核心修复二：使用 get() 宽口径，防止 AIME2026 的 'problem' 键名引发 KeyError
+                raw_q = data.get("question") or data.get("problem") or ""
+                gold = data.get("answer") or data.get("solution") or ""
+                test_samples.append(TaskSample(
+                    sample_id=f"aime2026_{idx}",
+                    task_type="AIME",
+                    prompt_data={"question": str(raw_q)},
+                    raw_question=str(raw_q),
+                    gold_answer=str(gold).strip()
+                ))
+        return test_samples
+
+    def load_folio_split(self) -> List[TaskSample]:
+        path = os.path.join(self.base_dir, "folio/validation.jsonl")
+        test_samples = []
+        with open(path, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                data = json.loads(line)
+                premises_list = data.get("premises", [])
+                premises_str = "\n".join(premises_list) if isinstance(premises_list, list) else str(premises_list)
+                conclusion = data.get("conclusion", "")
+                label = data.get("label", "")
+                
+                prompt = f"Premises:\n{premises_str}\n\nConclusion: {conclusion}\nIs the conclusion True, False, or Uncertain?"
+                test_samples.append(TaskSample(
+                    sample_id=f"folio_{idx}",
+                    task_type="FOLIO",
+                    prompt_data={"question": prompt},
+                    raw_question=prompt,
+                    gold_answer=str(label).strip()
+                ))
+        return test_samples
+
+    def load_p_folio_split(self) -> List[TaskSample]:
+        path = os.path.join(self.base_dir, "P-FOLIO/P-FOLIO.csv")
+        df = pd.read_csv(path)
+        test_samples = []
+        for idx, row in df.iterrows():
+            premises = str(row.get("premises", row.get("story", ""))).strip()
+            conclusion = str(row.get("conclusion", "")).strip()
+            label = str(row.get("label", row.get("target", ""))).strip()
+            
+            # 安全归一化 NaN
+            if pd.isna(row.get("label")) and pd.isna(row.get("target")):
+                label = "uncertain"
+                
+            prompt = f"Premises:\n{premises}\n\nConclusion: {conclusion}\nIs the conclusion True, False, or Uncertain?"
+            test_samples.append(TaskSample(
+                sample_id=f"pfolio_{idx}",
+                task_type="FOLIO",
+                prompt_data={"question": prompt},
+                raw_question=prompt,
+                gold_answer=label
+            ))
+        return test_samples
+
+    def load_livecodebench_split(self) -> List[TaskSample]:
+        test_samples = []
+        lcb_dir = os.path.join(self.base_dir, "livecodebench")
+        for i in range(1, 7):
+            path = os.path.join(lcb_dir, f"test{i}.jsonl")
+            if not os.path.exists(path):
+                path = os.path.join(lcb_dir, "test.jsonl")
+                if not os.path.exists(path):
+                    continue
+            with open(path, "r", encoding="utf-8") as f:
+                for idx, line in enumerate(f):
+                    data = json.loads(line)
+                    # 核心修复三：对 LCB 的 test_cases 键名采用多层 fallback 获取，防止返回空列表
+                    test_cases = data.get("test_cases") or data.get("test_case") or data.get("tests") or data.get("test") or []
+                    
+                    test_samples.append(TaskSample(
+                        sample_id=f"lcb_{i}_{idx}",
+                        task_type="LiveCodeBench",
+                        prompt_data={
+                            "question": data.get("question", ""),
+                            "test_cases": json.dumps(test_cases)
+                        },
+                        raw_question=data.get("question", ""),
+                        gold_answer=json.dumps(test_cases)
+                    ))
+            if path.endswith("test.jsonl"):
+                break
+        return test_samples
+
+    def load_math500_split(self) -> List[TaskSample]:
+        path = os.path.join(self.base_dir, "MATH-500/test.jsonl")
+        test_samples = []
+        with open(path, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                data = json.loads(line)
+                raw_q = data.get("problem") or data.get("question") or ""
+                gold = data.get("solution") or data.get("answer") or ""
+                test_samples.append(TaskSample(
+                    sample_id=f"math500_{idx}",
+                    task_type="MATH",
+                    prompt_data={"question": str(raw_q)},
+                    raw_question=str(raw_q),
+                    gold_answer=str(gold).strip()
+                ))
         return test_samples

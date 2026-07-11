@@ -1,29 +1,35 @@
 ise_flow/
-├── config/
-│   ├── schemas.py           # 拓扑常数声明：仅定义极简的 TOKEN 节点与 ATTENTION 边符号。
-│   └── settings.py          # 配置总线：彻底剥离 coarsening 与 cache 配置，管理多维物理成本预算。
 │
-├── data/
-│   ├── loaders.py           # 数据加载器：负责 GSM8K 与 HumanEval+ 数据集的本地 Parquet 物理读取。
-│   └── parsers.py           # 归一化编译器：集成 EHS-Normalizer 骨架化去噪器与数学答案 boxed 提纯。
+├── config/                          # 全局实验常数与多维物理成本配置
+│   ├── __init__.py                  
+│   ├── schemas.py                   # 定义极简的 TOKEN 节点与 ATTENTION 边拓扑常数
+│   └── settings.py                  # 配置多维物理成本向量与全局安全门控（如解析覆盖率阈值 ζ）
 │
-├── core/
-│   ├── risk_estimator.py    # 信息几何风险评估引擎：实现 IJP 解析、LDAS 自适应自缩放谱隙求解、EPA 商空间同伦对齐与假设指标随动回传。[核心重构]
-│   └── stcg.py              # 谱共识引擎：多路径同伦谱共识特征对齐。
+├── data/                            # 数据编译器与格式化 Ingestion 模块
+│   ├── __init__.py                  
+│   ├── loaders.py                   # 负责 GSM8K, HumanEvalPlus, FOLIO 等 8 类数据集的安全加载
+│   └── parsers.py                   # 提取 CoT 步骤与 EHS 骨架化去噪归一化器（EHSNormalizer）
 │
-├── llm/
-│   ├── generator.py         # 并发生成端：支持高并发 vLLM 调用，原生配置 top_logprobs 导出单纯形本征分布。[核心重构]
-│   └── prompts.py           # 轨迹 Prompt 模板：定义高可解析性格式约束指令。
+├── core/                            # 核心不确定性量化 (UQ) 估算中心
+│   ├── __init__.py                  
+│   └── risk_estimator.py            # 主引擎：实现自监督双同伦谱投影、量子混态密度算子与冯诺伊曼熵解算
 │
-├── routing/
-│   ├── calibration.py       # 变分标定器：RVSD 秩次极性对齐一维二分凸收敛寻根器，集成基于 MSO 均值的 OOD 自适应动态标定。[核心重构]
-│   ├── verifier_manager.py  # 验证器管理器：托管线程隔离执行沙箱（GSM8K 官方标准提纯、HumanEval+）。
-│   ├── router.py            # 成本路由器：执行多维资源预算边界检查与期望验证价值（EVV）背包路由。
-│   └── baselines.py         # 基线计算器：实现经过 CoT 去噪调整后的 NLL、SC、DeepConf 等对比算法。
+├── llm/                             # 外部推理端与自监督观测层
+│   ├── __init__.py                  
+│   ├── generator.py                 # vLLM 高并发客户端：集成子词共形投影观测器（LSO）
+│   └── prompts.py                   # 形式化约束指令集（数学、代码、逻辑 SMT 模板）
 │
-├── diagnostics/
-│   ├── tracker.py           # 指标追踪器：原子化记录变分状态。
-│   ├── analyzer.py          # 指标审计器：实现在线计算 ECE、Brier Score 及同分平局鲁棒（Fractional Ranking）的标准 AUROC。
-│   └── monitor.py           # 看板生成器：编译生成决策链追踪仪表盘。
+├── routing/                         # Platt-Beta 标定、多维背包路由与对比基线计算
+│   ├── __init__.py                  
+│   ├── calibration.py               # Platt-Beta 无监督极性自锁对齐标定器（基于 MSO 在线辨识）
+│   ├── router.py                    # 路由器：多维物理成本剩余预算 B 边界检查与期望损失最小化兜底分配
+│   ├── verifier_manager.py          # 物理法官：托管 8 类数据集官方评估引擎（如 evalplus 物理沙箱、SymPy、Z3）
+│   └── baselines.py                 # 顶会基线库：计算 NLL, SC, Self-Certainty, SE, SAR, U_Ecc, U_Deg
 │
-└── run_pipeline.py          # 启动主程序：整合单/多路径独立标定，集成本征信息几何诊断台与假设指标实证分析。[核心重构]
+├── diagnostics/                     # 运行时状态审计与可视化监控
+│   ├── __init__.py                  
+│   ├── tracker.py                   # 线程安全记录样本决策轨迹指标（落盘至 JSONL 诊断日志）
+│   ├── analyzer.py                  # 审计器：解算 AUROC, AUPRC, ECE 并运行不变量显著性检验
+│   └── monitor.py                   # 自动将 JSONL 日志编译为全流程决策轨迹 HTML/Markdown 看板
+│
+└── run_pipeline.py                  # 启动主控程序：调度并发采样、执行 UQ 与路由、渲染学术 LaTeX 报表
