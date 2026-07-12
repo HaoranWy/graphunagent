@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ISE-Flow 变分局域多步扩散、自监督共形语义密度与无泄露主纤维丛形式验证 (v5.5-Pristine) 评测流水线."""
+"""ISE-Flow 评测流水线."""
 
 import sys
 import random

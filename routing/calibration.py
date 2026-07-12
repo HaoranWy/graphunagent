@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ISE-Flow 全任务域极性本征安全对齐的 Platt-Beta 校准器 (v5.0)."""
+"""ISE-Flow 全任务域极性本征安全对齐的 Platt-Beta 校准器."""
 
 import bisect
 import math
