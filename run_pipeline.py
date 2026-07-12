@@ -1,565 +1,959 @@
-# -*- coding: utf-8 -*-
-"""ISE-Flow 评测流水线."""
+"""Publication-grade PWSC experiment runner.
 
-import sys
-import random
+The default mode is the frozen paper protocol: a complete primary-domain test
+split, sixteen sampled paths, and offline evaluation at N={1,4,8,16}.  Partial
+runs require an explicit ``--mode smoke`` so their artifacts cannot be mistaken
+for paper results.
+"""
+
+from __future__ import annotations
+
 import argparse
-import logging
-import os
 import csv
+import hashlib
+import importlib.metadata
 import json
+import logging
+import platform
+import random
+import sys
 import time
-import re
 from collections import Counter
-from typing import List, Dict, Any, Tuple, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-# 导入配置、加载器、生成器与核心风险分析模块
 from config.settings import ExperimentSettings
+from core.adapters import make_adapter
+from core.risk_estimator import RiskEstimator, retain_scoring_tokens
 from data.loaders import DatasetLoader, TaskSample
-from llm.generator import APIGenerator
-from core.risk_estimator import RiskEstimator
-from routing.calibration import PriorConditionedCalibrator
-from routing.verifier_manager import VerifierManager
-from routing.router import BatchRouter
-from routing.baselines import SCSVBaselines  
-from data.parsers import TrajectoryParser
-from diagnostics.tracker import TrajectoryTracker
 from diagnostics.analyzer import ScientificSignalAnalyzer
+from llm.generator import APIGenerator
+from routing.baselines import SCSVBaselines
+from routing.verifier_manager import VerifierManager
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("ise_flow.cli")
 
-TQDM_AVAILABLE = False
 try:
     from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except Exception:
-    pass
+except ImportError:  # pragma: no cover
+    tqdm = None  # type: ignore
 
 
-def filter_reasoning_logprobs_full(logprob_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """过滤 CoT 推理链中的思考噪声, 提取纯净概率流."""
-    if not logprob_items:
-        return []
-    end_think_idx = -1
-    for idx, item in enumerate(logprob_items):
-        tok = item.get("token", "")
-        if "</think>" in tok:
-            end_think_idx = idx
-            break
-    if end_think_idx != -1:
-        return logprob_items[end_think_idx + 1:]
-    return logprob_items
+PRIMARY_TASKS = ("GSM8K", "MATH-500", "HumanEvalPlus", "FOLIO")
+DEFAULT_ENSEMBLE_SIZES = (1, 4, 8, 16)
+CACHE_SCHEMA_VERSION = 2
+BOOTSTRAP_SAMPLES = 1000
+
+
+def filter_reasoning_logprobs_full(logprob_items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Compatibility name; PWSC retains reasoning and answer tokens alike."""
+    return list(logprob_items or [])
 
 
 def extract_homotopy_outcome(text: str, task_name: str) -> str:
-    """提取答案同伦 outcomes, 彻底阻断因字面格式差异导致的 Čech 阻碍失效."""
-    if not text:
-        return "null_raw"
-    text_clean = text.strip()
-    
-    if task_name in ["HumanEvalPlus", "LiveCodeBench"]:
-        if "```python" in text_clean:
-            return text_clean.split("```python")[-1].split("```")[0].strip()
-        return text_clean
-        
-    elif task_name in ["GSM8K", "AIME2025", "AIME2026", "MATH-500"]:
-        _, final_ans, _ = TrajectoryParser.parse_cot_steps(text_clean)
-        if final_ans:
-            return final_ans.strip()
-        nums = re.findall(r"(-?\d+(?:\.\d+)?)", text_clean)
-        return nums[-1] if nums else text_clean
-        
-    elif task_name in ["FOLIO", "P-FOLIO"]:
-        text_lower = text_clean.lower()
-        matches = list(re.finditer(r"\b(true|false|uncertain)\b", text_lower))
-        if matches:
-            return matches[-1].group(1)
-        return text_clean
-    
-    return text_clean
+    """Compatibility wrapper around the canonical domain adapter."""
+    return make_adapter(task_name, [None]).outcome_keys([text])[0]
 
 
-def compute_academic_metrics(y_true: List[int], y_scores: List[float], is_correct_list: List[bool]) -> Dict[str, float]:
-    """【不变量核心审计测度】计算标准的 AUROC、AUPRC、ECE、Brier 与 Top-50% 准确率."""
+def parse_ensemble_sizes(value: str | Sequence[int]) -> Tuple[int, ...]:
+    if isinstance(value, str):
+        try:
+            sizes = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+        except ValueError as exc:
+            raise ValueError("ensemble sizes must be comma-separated integers") from exc
+    else:
+        sizes = tuple(int(item) for item in value)
+    if not sizes or any(size < 1 for size in sizes):
+        raise ValueError("ensemble sizes must be positive")
+    if tuple(sorted(set(sizes))) != sizes:
+        raise ValueError("ensemble sizes must be unique and increasing")
+    return sizes
+
+
+def validate_protocol(
+    run_mode: str,
+    task_name: str,
+    sample_limit: int,
+    num_samples: int,
+    ensemble_sizes: Sequence[int],
+) -> None:
+    if num_samples < max(ensemble_sizes):
+        raise ValueError("num_samples must cover the largest requested ensemble size")
+    if run_mode == "paper":
+        if task_name not in PRIMARY_TASKS:
+            raise ValueError(f"paper mode is restricted to primary tasks: {PRIMARY_TASKS}")
+        if sample_limit != 0:
+            raise ValueError("paper mode requires --limit 0 (the complete split); use --mode smoke for subsets")
+        if num_samples != 16 or tuple(ensemble_sizes) != DEFAULT_ENSEMBLE_SIZES:
+            raise ValueError("paper mode requires --num_samples 16 and --ensemble_sizes 1,4,8,16")
+    elif run_mode == "stress":
+        if task_name in PRIMARY_TASKS:
+            raise ValueError("stress mode is for optional domains; use paper mode for primary tasks")
+    elif run_mode == "smoke":
+        if sample_limit <= 0:
+            raise ValueError("smoke mode requires an explicit positive --limit")
+    else:
+        raise ValueError(f"unknown run mode: {run_mode}")
+
+
+def compute_academic_metrics(
+    y_true: Sequence[int],
+    y_scores: Sequence[float],
+    is_correct_list: Optional[Sequence[bool]] = None,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    # Keep the pre-paper helper signature usable for downstream scripts that
+    # passed a correctness list as the third positional argument.
+    if isinstance(is_correct_list, (int, np.integer)) and seed == 0:
+        seed = int(is_correct_list)
+        is_correct_list = None
     auroc = ScientificSignalAnalyzer.calculate_auroc(y_true, y_scores)
     auprc = ScientificSignalAnalyzer.calculate_auprc(y_true, y_scores)
-    ece = ScientificSignalAnalyzer.calculate_ece(y_true, y_scores)
-    brier = ScientificSignalAnalyzer.calculate_brier_score(y_true, y_scores)
-    top_50_acc = ScientificSignalAnalyzer.calculate_top_50_acc(is_correct_list, y_scores)
+    aurc = ScientificSignalAnalyzer.calculate_aurc(y_true, y_scores)
+    _, ci_low, ci_high = ScientificSignalAnalyzer.bootstrap_ci(
+        y_true,
+        y_scores,
+        ScientificSignalAnalyzer.calculate_auroc,
+        seed=seed,
+        n_bootstrap=BOOTSTRAP_SAMPLES,
+    )
     return {
         "AUROC": auroc,
         "AUPRC": auprc,
-        "ECE": ece,
-        "Brier": brier,
-        "Top-50% ACC": top_50_acc
+        "AURC": aurc,
+        "SelectiveAcc@50": ScientificSignalAnalyzer.calculate_selective_accuracy(y_true, y_scores, 0.5),
+        "AUROC_CI95": [ci_low, ci_high],
+        "ECE": None,
+        "Brier": None,
+        **(
+            {"Top-50% ACC": ScientificSignalAnalyzer.calculate_top_50_acc(is_correct_list, y_scores)}
+            if is_correct_list is not None
+            else {}
+        ),
     }
 
 
 class UniversalDatasetLoader(DatasetLoader):
-    """通用多数据集物理加载路由器."""
-
-    def load_any_dataset(self, task_name: str) -> List[TaskSample]:
+    def load_any_dataset(self, task_name: str, limit: Optional[int] = None) -> List[TaskSample]:
         if task_name == "GSM8K":
-            _, test_samples = self.load_gsm8k_split()
-            return test_samples
-        elif task_name == "HumanEvalPlus":
-            return self.load_humanevalplus_test()
-        elif task_name == "AIME2025":
-            return self.load_aime2025_split()
-        elif task_name == "AIME2026":
-            return self.load_aime2026_split()
-        elif task_name == "FOLIO":
-            return self.load_folio_split()
-        elif task_name == "P-FOLIO":
-            return self.load_p_folio_split()
-        elif task_name == "LiveCodeBench":
-            return self.load_livecodebench_split()
-        elif task_name == "MATH-500":
-            return self.load_math500_split()
+            samples = self.load_gsm8k_split()[1]
+            return samples[:limit] if limit and limit > 0 else samples
+        if task_name == "HumanEvalPlus":
+            return self.load_humanevalplus_test(limit)
+        if task_name == "AIME2025":
+            return self.load_aime2025_split(limit)
+        if task_name == "AIME2026":
+            return self.load_aime2026_split(limit)
+        if task_name == "FOLIO":
+            return self.load_folio_split(limit)
+        if task_name == "P-FOLIO":
+            return self.load_p_folio_split(limit)
+        if task_name == "LiveCodeBench":
+            return self.load_livecodebench_split(limit)
+        if task_name == "MATH-500":
+            return self.load_math500_split(limit)
+        raise NotImplementedError(f"Unsupported dataset domain: {task_name}")
+
+
+def _verifier_id(task_name: str) -> str:
+    return {
+        "HumanEvalPlus": "humaneval_plus_tester",
+        "LiveCodeBench": "lcb_tester",
+        "AIME2025": "math_official_tester",
+        "AIME2026": "math_official_tester",
+        "MATH-500": "math_official_tester",
+        "FOLIO": "folio_tester",
+        "P-FOLIO": "folio_tester",
+        "GSM8K": "gsm8k_official_tester",
+    }[task_name]
+
+
+def _sample_metadata(sample: TaskSample, task_name: str) -> Dict[str, Any]:
+    metadata = dict(sample.metadata or {})
+    metadata.update(sample.prompt_data or {})
+    if task_name == "HumanEvalPlus":
+        metadata.setdefault("entry_point", sample.prompt_data.get("entry_point", ""))
+        metadata.setdefault("task_id", sample.sample_id)
+    return metadata
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+        return None
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _redact_command(command: Sequence[str]) -> List[str]:
+    redacted: List[str] = []
+    hide_next = False
+    for item in command:
+        if hide_next:
+            redacted.append("<redacted>")
+            hide_next = False
+        elif item == "--api_key":
+            redacted.append(item)
+            hide_next = True
+        elif item.startswith("--api_key="):
+            redacted.append("--api_key=<redacted>")
         else:
-            raise NotImplementedError(f"Unsupported dataset domain: {task_name}")
+            redacted.append(item)
+    return redacted
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _input_sha256(samples: Sequence[TaskSample]) -> str:
+    payload = [{"sample_id": sample.sample_id, "prompt": sample.raw_question} for sample in samples]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _trace_batch_complete(traces: Sequence[Dict[str, Any]], num_samples: int) -> bool:
+    if len(traces) < num_samples:
+        return False
+    for trace in traces[:num_samples]:
+        if not str(trace.get("text", "")).strip():
+            return False
+        if not retain_scoring_tokens(trace.get("logprobs", [])):
+            return False
+    return True
+
+
+def _majority_index(outcomes: Sequence[str], confidences: Sequence[float]) -> int:
+    counts = Counter(outcomes)
+    first_position = {key: list(outcomes).index(key) for key in counts}
+    confidence_by_key = {
+        key: sum(float(confidences[idx]) for idx, value in enumerate(outcomes) if value == key)
+        for key in counts
+    }
+    winning_key = max(
+        counts,
+        key=lambda key: (counts[key], confidence_by_key[key], -first_position[key]),
+    )
+    candidates = [idx for idx, value in enumerate(outcomes) if value == winning_key]
+    return max(candidates, key=lambda idx: (float(confidences[idx]), -idx))
+
+
+def _mbr_index(kernel: np.ndarray, weights: Optional[np.ndarray]) -> int:
+    matrix = np.asarray(kernel, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        return 0
+    if weights is None:
+        normalized = np.ones(matrix.shape[0], dtype=np.float64) / matrix.shape[0]
+    else:
+        normalized = np.asarray(weights, dtype=np.float64)
+        normalized = normalized / normalized.sum() if normalized.sum() > 0 else np.ones(matrix.shape[0]) / matrix.shape[0]
+    return int(np.argmax(matrix @ normalized))
 
 
 class AcademicExperimentRunner:
-    """学术级神经-符号主纤维丛不确定性量化实验运行中心."""
-
     def __init__(
-        self, 
+        self,
         settings: Optional[ExperimentSettings] = None,
         model_name: str = "deepseek",
         model_url: str = "http://127.0.0.1:8000/v1",
         api_key: str = "empty",
-        top_k: int = 10
+        top_k: int = 10,
+        dataset_root: str = "/data/newmodel/graphunagent/datasets",
+        temperature: float = 0.7,
+        max_tokens: int = 12000,
+        max_workers: int = 8,
+        generation_batch_size: int = 32,
+        expected_model_revision: str = "",
     ) -> None:
         self.settings = settings or ExperimentSettings()
-        self.loader = UniversalDatasetLoader()
+        self.model_name = model_name
+        self.model_url = model_url
+        self.top_k = int(top_k)
+        self.temperature = float(temperature)
+        self.max_tokens = int(max_tokens)
+        self.max_workers = int(max_workers)
+        self.generation_batch_size = int(generation_batch_size)
+        self.expected_model_revision = expected_model_revision
+        if self.max_tokens < 1 or self.max_workers < 1 or self.generation_batch_size < 1:
+            raise ValueError("max_tokens, max_workers, and generation_batch_size must be positive")
+        self.loader = UniversalDatasetLoader(dataset_root)
         self.verifier_mgr = VerifierManager()
-        
         self.generator = APIGenerator(
             model_name=model_name,
             api_key=api_key,
             base_url=model_url,
             seed=self.settings.random_seed,
-            top_k_logprobs=top_k
+            top_k_logprobs=top_k,
         )
-        
-        # 严格无泄露初始化：不将 verifier_mgr 传入 UQ 主回路，保障无监督 UQ 正义性
-        self.risk_estimator = RiskEstimator(verifier_mgr=None, generator=self.generator)
-        self.tracker = TrajectoryTracker()
+        self.risk_estimator = RiskEstimator(weakest_k=self.settings.pwsc.weakest_k)
 
-    def _determine_consensus_correctness(self, answers: List[str], task_name: str, gold_answer: str, metadata_list: List[Dict[str, Any]]) -> Tuple[bool, str]:
-        """多数投票机制求解多路径系综的客观金标对错 (本评测部分属于正常评估, 不计入风险特征流)."""
-        if not answers:
-            return False, "null"
-        
-        cleaned_ans_list = [extract_homotopy_outcome(ans, task_name) for ans in answers]
-        counter = Counter(cleaned_ans_list)
-        voted_ans, _ = counter.most_common(1)[0]
-        
-        voted_idx = cleaned_ans_list.index(voted_ans)
-        raw_voted_text = answers[voted_idx]
-        
-        task_to_verifier = {
-            "HumanEvalPlus": "humaneval_plus_tester",
-            "AIME2025": "math_official_tester",
-            "AIME2026": "math_official_tester",
-            "MATH-500": "math_official_tester",
-            "FOLIO": "folio_tester",
-            "P-FOLIO": "folio_tester",
-            "LiveCodeBench": "lcb_tester",
-            "GSM8K": "gsm8k_official_tester"
-        }
-        verifier_id = task_to_verifier.get(task_name, "gsm8k_official_tester")
-        verifier = self.verifier_mgr.verifiers[verifier_id]
-        
-        meta = metadata_list[voted_idx] if (metadata_list and voted_idx < len(metadata_list)) else None
-        is_correct = verifier.execute(raw_voted_text, gold_answer, metadata=meta)
-            
-        return is_correct, raw_voted_text
-
-    def run_benchmark_experiment(self, task_name: str = "GSM8K", sample_limit: int = 30, num_samples: int = 16) -> Tuple[Dict[str, Any], Dict[str, Any], float, List[Dict[str, Any]]]:
-        test_samples = self.loader.load_any_dataset(task_name)
-        if sample_limit and sample_limit > 0:
-            test_samples = test_samples[:sample_limit]
-
-        test_prompts = [s.raw_question for s in test_samples]
-        test_sc_traces = self.generator.generate_consistency_samples(
-            test_prompts, num_samples=num_samples, task_type=task_name
-        )
-
-        single_path_inputs = []
-        ensemble_path_inputs = []
-        
-        y_true_single = []
-        y_true_ensemble = []
-        
-        baselines_single: Dict[str, List[float]] = {
-            "Vanilla Logprob (NLL)": [],
-            "Self-Certainty": [],
-            "DeepConf (Lowest Window)": [],
-            "LL": [],
-            "P_True": []
-        }
-        baselines_ensemble: Dict[str, List[float]] = {
-            "Self-Consistency": [],
-            "Semantic Entropy (SE)": [],
-            "U_Ecc": [],
-            "U_Deg": [],
-            "SAR": []
-        }
-
-        # 几何随动特征诊断
-        diagnostic_metrics = {
-            "correct_group": {"msg": [], "mso": [], "sbp": [], "hodge_ex": [], "hodge_coex": [], "cech_obs": []},
-            "incorrect_group": {"msg": [], "mso": [], "sbp": [], "hodge_ex": [], "hodge_coex": [], "cech_obs": []}
-        }
-
-        mso_all = []
-        intermediate_rows = []
-
-        task_to_verifier = {
-            "HumanEvalPlus": "humaneval_plus_tester",
-            "AIME2025": "math_official_tester",
-            "AIME2026": "math_official_tester",
-            "MATH-500": "math_official_tester",
-            "FOLIO": "folio_tester",
-            "P-FOLIO": "folio_tester",
-            "LiveCodeBench": "lcb_tester",
-            "GSM8K": "gsm8k_official_tester"
-        }
-        verifier_id = task_to_verifier.get(task_name, "gsm8k_official_tester")
-        verifier = self.verifier_mgr.verifiers[verifier_id]
-
-        iterator = zip(test_samples, test_sc_traces)
-        if TQDM_AVAILABLE:
-            iterator = tqdm(iterator, total=len(test_samples), desc=f"CSSV Sheaf Auditing (N={num_samples})")
-
-        for idx, (sample, traces_dict_list) in enumerate(iterator):
-            traces_text_only = [t["text"] for t in traces_dict_list]
-            
-            # ----------------- A. 单路径计算 -----------------
-            tau_single = traces_dict_list[0]["text"]
-            raw_logprobs_single = traces_dict_list[0]["logprobs"]
-
-            filtered_raw_logprobs_single = filter_reasoning_logprobs_full(raw_logprobs_single)
-            filtered_logprobs_single = [item["logprob"] for item in filtered_raw_logprobs_single]
-
-            # 100% 保证无 gold_answer 泄露
-            r_struct_single, _, h_curve_single, extra_diag_single = self.risk_estimator.estimate_structural_risk(
-                G_sequence=None, 
-                schema_name=task_name, 
-                trajectory_text=tau_single, 
-                gold_answer="", 
-                entry_point=sample.prompt_data.get("entry_point", ""),
-                logprobs=filtered_raw_logprobs_single,
-                attentions=None
+    def _model_metadata(self, cache_header: Optional[Dict[str, Any]], run_mode: str) -> Dict[str, Any]:
+        if cache_header is not None:
+            metadata = dict(cache_header.get("model", {}))
+        else:
+            try:
+                metadata = self.generator.describe_model()
+            except Exception:
+                if run_mode == "paper":
+                    raise
+                metadata = {"id": self.model_name, "root": None, "metadata_unavailable": True}
+        if metadata.get("id") != self.model_name:
+            raise ValueError(f"model mismatch: cache/server has {metadata.get('id')!r}, CLI requested {self.model_name!r}")
+        revision = str(metadata.get("root") or metadata.get("revision") or metadata.get("id") or "")
+        if self.expected_model_revision and revision != self.expected_model_revision:
+            raise ValueError(f"model revision mismatch: expected {self.expected_model_revision!r}, got {revision!r}")
+        metadata["resolved_revision"] = revision
+        root = Path(revision)
+        if root.is_dir():
+            descriptor_names = (
+                "config.json",
+                "generation_config.json",
+                "model.safetensors.index.json",
+                "tokenizer_config.json",
             )
-
-            baselines_single["Vanilla Logprob (NLL)"].append(SCSVBaselines.calculate_nll(filtered_logprobs_single, apply_ln=True))
-            baselines_single["Self-Certainty"].append(SCSVBaselines.calculate_self_certainty(filtered_logprobs_single, apply_ln=True))
-            baselines_single["DeepConf (Lowest Window)"].append(SCSVBaselines.calculate_deep_conf(filtered_logprobs_single, window_size=5, apply_ln=True))
-            baselines_single["LL"].append(SCSVBaselines.calculate_ll(filtered_logprobs_single))
-            baselines_single["P_True"].append(SCSVBaselines.calculate_p_true(filtered_logprobs_single))
-
-            metadata = {"entry_point": sample.prompt_data.get("entry_point", ""), "task_id": sample.sample_id} if task_name == "HumanEvalPlus" else None
-            is_correct_single = verifier.execute(tau_single, sample.gold_answer, metadata=metadata)
-            y_true_single.append(0 if is_correct_single else 1)
-
-            single_path_inputs.append({
-                "sample_id": sample.sample_id,
-                "raw_f_tau": r_struct_single,
-                "p_wrong": r_struct_single,
-                "mso": extra_diag_single["fiedler_connectivity"]
-            })
-
-            # ----------------- B. 多路径系综计算 -----------------
-            all_paths_logprobs = [filter_reasoning_logprobs_full(t["logprobs"]) for t in traces_dict_list]
-            all_attns = [t.get("attentions", None) for t in traces_dict_list]
-            
-            cleaned_answers = [extract_homotopy_outcome(ans, task_name) for ans in traces_text_only]
-            meta_list = [{"entry_point": sample.prompt_data.get("entry_point", ""), "task_id": sample.sample_id} if task_name == "HumanEvalPlus" else None for _ in range(num_samples)]
-
-            # 纯自监督，无泄露运行
-            epa_val, extra_diag_ensemble = self.risk_estimator.estimate_ensemble_risk(
-                all_paths_logprobs, 
-                traces_text_only,
-                gold_answer="",
-                metadata_list=None,
-                schema_name=task_name
-            )
-
-            baselines_ensemble["Self-Consistency"].append(SCSVBaselines.calculate_self_consistency(traces_text_only, cleaned_answers))
-            baselines_ensemble["Semantic Entropy (SE)"].append(SCSVBaselines.calculate_semantic_entropy(traces_text_only, cleaned_answers))
-            
-            lso = self.generator.lso
-            sim_matrix = lso.compute_conformal_similarity([extract_homotopy_outcome(t, task_name) for t in traces_text_only])
-            baselines_ensemble["U_Ecc"].append(SCSVBaselines.calculate_u_ecc(traces_text_only, sim_matrix))
-            baselines_ensemble["U_Deg"].append(SCSVBaselines.calculate_u_deg(traces_text_only, sim_matrix))
-            baselines_ensemble["SAR"].append(SCSVBaselines.calculate_sar(filtered_logprobs_single))
-
-            is_correct_ensemble, voted_text = self._determine_consensus_correctness(
-                traces_text_only, task_name, sample.gold_answer, meta_list
-            )
-            y_true_ensemble.append(0 if is_correct_ensemble else 1)
-            mso_all.append(extra_diag_ensemble["fiedler_connectivity"])
-
-            ensemble_path_inputs.append({
-                "sample_id": sample.sample_id,
-                "raw_f_tau": epa_val,
-                "p_wrong": epa_val,
-                "trajectory_text": traces_text_only[0],
-                "is_correct": is_correct_ensemble,
-                "mso": extra_diag_ensemble["fiedler_connectivity"]
-            })
-
-            # ----------------- C. 拓扑诊断统计 -----------------
-            group_key = "correct_group" if is_correct_ensemble else "incorrect_group"
-            diagnostic_metrics[group_key]["msg"].append(extra_diag_ensemble["avg_edge_weight"])
-            diagnostic_metrics[group_key]["mso"].append(extra_diag_ensemble["fiedler_connectivity"])
-            diagnostic_metrics[group_key]["sbp"].append(extra_diag_ensemble["attention_entropy"])
-            diagnostic_metrics[group_key]["hodge_ex"].append(extra_diag_ensemble["hodge_exact_ratio"])
-            diagnostic_metrics[group_key]["hodge_coex"].append(extra_diag_ensemble["hodge_coexact_ratio"])
-            diagnostic_metrics[group_key]["cech_obs"].append(extra_diag_ensemble["cech_obstruction"])
-
-            intermediate_rows.append({
-                "sample_id": sample.sample_id,
-                "raw_question": sample.raw_question[:150].replace("\n", " "),
-                "gold_answer": sample.gold_answer,
-                "single_is_correct": is_correct_single,
-                "single_p_wrong_score": r_struct_single,
-                "single_calibrated_p_wrong": r_struct_single,
-                "ensemble_is_correct": is_correct_ensemble,
-                "ensemble_p_wrong_score": epa_val,
-                "ensemble_calibrated_p_wrong": epa_val,
-                "msg_spectral_gap": extra_diag_ensemble["avg_edge_weight"],
-                "mso_spectral_obstruction": extra_diag_ensemble["fiedler_connectivity"]
-            })
-
-        # B. Platt-Beta MTPA 极性自锁标定 (自锁稳定版)
-        all_raw_f_single = [item["raw_f_tau"] for item in single_path_inputs]
-        mso_single_all = [item["mso"] for item in single_path_inputs]
-        calibrator_single = PriorConditionedCalibrator()
-        calibrator_single.fit(all_raw_f_single, unsupervised_reference=baselines_single["Vanilla Logprob (NLL)"], mso_scores=mso_single_all)
-        for idx, item in enumerate(single_path_inputs):
-            p_w = calibrator_single.calibrate(item["raw_f_tau"])
-            item["p_wrong"] = p_w
-            intermediate_rows[idx]["single_calibrated_p_wrong"] = p_w
-
-        all_raw_f_ensemble = [item["raw_f_tau"] for item in ensemble_path_inputs]
-        calibrator_ensemble = PriorConditionedCalibrator()
-        calibrator_ensemble.fit(all_raw_f_ensemble, unsupervised_reference=baselines_ensemble["Self-Consistency"], mso_scores=mso_all)
-        for idx, item in enumerate(ensemble_path_inputs):
-            p_w = calibrator_ensemble.calibrate(item["raw_f_tau"])
-            item["p_wrong"] = p_w
-            intermediate_rows[idx]["ensemble_calibrated_p_wrong"] = p_w
-
-        # ----------------- C. 评估与大表格式化 -----------------
-        y_scores_rise_single = [item["p_wrong"] for item in single_path_inputs]
-        is_corr_single_bool = [y == 0 for y in y_true_single]
-
-        y_scores_rise_ensemble = [item["p_wrong"] for item in ensemble_path_inputs]
-        is_corr_ens_bool = [y == 0 for y in y_true_ensemble]
-
-        experiment_results: Dict[str, Any] = {
-            "Single-Path Methods": {
-                "LDAS / FIM (Ours-Single)": compute_academic_metrics(y_true_single, y_scores_rise_single, is_corr_single_bool)
-            },
-            "Multi-Path Methods": {
-                "EPA / FIM (Ours-Ensemble)": compute_academic_metrics(y_true_ensemble, y_scores_rise_ensemble, is_corr_ens_bool)
+            descriptors = []
+            for name in descriptor_names:
+                path = root / name
+                if path.exists():
+                    descriptors.append({"name": name, "bytes": path.stat().st_size, "sha256": _sha256_file(path)})
+            shards = [
+                {"name": path.name, "bytes": path.stat().st_size}
+                for path in sorted(root.glob("*.safetensors"))
+            ]
+            fingerprint_payload = {"descriptors": descriptors, "weight_shards": shards}
+            metadata["local_fingerprint"] = {
+                **fingerprint_payload,
+                "descriptor_sha256": hashlib.sha256(
+                    json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
             }
+        return metadata
+
+    @staticmethod
+    def _read_cache_header(path: Path) -> Dict[str, Any]:
+        with path.open(encoding="utf-8") as handle:
+            first = handle.readline()
+        if not first:
+            raise ValueError(f"empty generation cache: {path}")
+        header = json.loads(first)
+        if header.get("record_type") != "meta" or header.get("schema_version") != CACHE_SCHEMA_VERSION:
+            raise ValueError("cache is not a PWSC paper-runner v2 cache")
+        return header
+
+    def _validate_cache_header(
+        self,
+        header: Dict[str, Any],
+        task_name: str,
+        samples: Sequence[TaskSample],
+        num_samples: int,
+        dataset_fingerprint: Dict[str, Any],
+        run_mode: str,
+    ) -> None:
+        expected = {
+            "run_mode": run_mode,
+            "task": task_name,
+            "seed": self.settings.random_seed,
+            "num_samples": num_samples,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "requested_top_logprobs": self.top_k,
+            "system_prompt_sha256": hashlib.sha256(
+                self.generator._system_prompt(task_name).encode("utf-8")
+            ).hexdigest(),
+            "input_sha256": _input_sha256(samples),
+        }
+        for key, value in expected.items():
+            if header.get(key) != value:
+                raise ValueError(f"cache {key} mismatch: expected {value!r}, got {header.get(key)!r}")
+        if header.get("dataset") != dataset_fingerprint:
+            raise ValueError("cache dataset fingerprint does not match current local data")
+
+    def _prepare_generation_cache(
+        self,
+        task_name: str,
+        samples: Sequence[TaskSample],
+        num_samples: int,
+        run_mode: str,
+        dataset_fingerprint: Dict[str, Any],
+        cache_path: Optional[str],
+    ) -> Tuple[Path, str, Dict[str, Any]]:
+        if cache_path:
+            path = Path(cache_path).expanduser().resolve()
+            if not path.exists():
+                raise FileNotFoundError(f"generation cache not found: {path}")
+            header = self._read_cache_header(path)
+            self._validate_cache_header(header, task_name, samples, num_samples, dataset_fingerprint, run_mode)
+            model_metadata = self._model_metadata(header, run_mode)
+            return path, _sha256_file(path), model_metadata
+
+        model_metadata = self._model_metadata(None, run_mode)
+        cache_dir = Path(__file__).resolve().parent / "diagnostics" / f"{run_mode}_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / f"generations_{task_name}_{time.time_ns()}_{_input_sha256(samples)[:10]}.jsonl"
+        header = {
+            "record_type": "meta",
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "method": self.settings.pwsc.method_version,
+            "run_mode": run_mode,
+            "task": task_name,
+            "seed": self.settings.random_seed,
+            "num_samples": num_samples,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "requested_top_logprobs": self.top_k,
+            "system_prompt": self.generator._system_prompt(task_name),
+            "system_prompt_sha256": hashlib.sha256(
+                self.generator._system_prompt(task_name).encode("utf-8")
+            ).hexdigest(),
+            "input_sha256": _input_sha256(samples),
+            "dataset": dataset_fingerprint,
+            "model": model_metadata,
+        }
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(_json_safe(header), sort_keys=True, ensure_ascii=False) + "\n")
+            for start in range(0, len(samples), self.generation_batch_size):
+                batch = samples[start : start + self.generation_batch_size]
+                generated = self.generator.generate_consistency_samples(
+                    [sample.raw_question for sample in batch],
+                    num_samples=num_samples,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    max_workers=self.max_workers,
+                    task_type=task_name,
+                )
+                if len(generated) != len(batch):
+                    raise RuntimeError(f"generator returned {len(generated)} batches for {len(batch)} prompts")
+                for sample, traces in zip(batch, generated):
+                    record = {
+                        "record_type": "sample",
+                        "sample_id": sample.sample_id,
+                        "prompt_sha256": hashlib.sha256(sample.raw_question.encode("utf-8")).hexdigest(),
+                        "traces": traces,
+                    }
+                    handle.write(json.dumps(_json_safe(record), sort_keys=True, ensure_ascii=False) + "\n")
+                handle.flush()
+        return path, _sha256_file(path), model_metadata
+
+    @staticmethod
+    def _iter_generation_cache(path: Path, samples: Sequence[TaskSample]) -> Iterator[Tuple[TaskSample, List[Dict[str, Any]]]]:
+        with path.open(encoding="utf-8") as handle:
+            header = json.loads(handle.readline())
+            if header.get("record_type") != "meta":
+                raise ValueError("generation cache is missing its metadata header")
+            count = 0
+            for sample, line in zip(samples, handle):
+                record = json.loads(line)
+                prompt_hash = hashlib.sha256(sample.raw_question.encode("utf-8")).hexdigest()
+                if record.get("record_type") != "sample" or record.get("sample_id") != sample.sample_id:
+                    raise ValueError(f"cache sample order mismatch at index {count}")
+                if record.get("prompt_sha256") != prompt_hash:
+                    raise ValueError(f"cache prompt mismatch for {sample.sample_id}")
+                count += 1
+                yield sample, list(record.get("traces", []))
+            if count != len(samples):
+                raise ValueError(f"cache contains {count} aligned samples; expected {len(samples)}")
+            if any(line.strip() for line in handle):
+                raise ValueError("cache contains extra sample records")
+
+    def preflight(
+        self,
+        task_name: str,
+        sample_limit: int,
+        num_samples: int,
+        ensemble_sizes: Sequence[int],
+        run_mode: str,
+        cache_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        validate_protocol(run_mode, task_name, sample_limit, num_samples, ensemble_sizes)
+        samples = self.loader.load_any_dataset(task_name, sample_limit)
+        dataset = self.loader.dataset_fingerprint(task_name)
+        cache_header = self._read_cache_header(Path(cache_path).resolve()) if cache_path else None
+        model = self._model_metadata(cache_header, run_mode)
+        if cache_header:
+            self._validate_cache_header(cache_header, task_name, samples, num_samples, dataset, run_mode)
+        return {
+            "status": "ready",
+            "run_mode": run_mode,
+            "task": task_name,
+            "sample_count": len(samples),
+            "num_samples": num_samples,
+            "ensemble_sizes": list(ensemble_sizes),
+            "seed": self.settings.random_seed,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "system_prompt_sha256": hashlib.sha256(
+                self.generator._system_prompt(task_name).encode("utf-8")
+            ).hexdigest(),
+            "model": model,
+            "dataset": dataset,
+            "cache_path": str(Path(cache_path).resolve()) if cache_path else None,
         }
 
-        for b_name, scores in baselines_single.items():
-            min_s, max_s = min(scores), max(scores)
-            norm_scores = [(s - min_s) / (max_s - min_s + 1e-12) for s in scores]
-            experiment_results["Single-Path Methods"][b_name] = compute_academic_metrics(y_true_single, norm_scores, is_corr_single_bool)
-
-        for b_name, scores in baselines_ensemble.items():
-            min_s, max_s = min(scores), max(scores)
-            norm_scores = [(s - min_s) / (max_s - min_s + 1e-12) for s in scores]
-            experiment_results["Multi-Path Methods"][b_name] = compute_academic_metrics(y_true_ensemble, norm_scores, is_corr_ens_bool)
-
-        # ----------------- D. 路由器效用计算 -----------------
-        router = BatchRouter(
-            verifier_mgr=self.verifier_mgr,
-            budget_limit=self.settings.cost_budget.budget_vector_20,
-            loss_err=10.0,
-            loss_abs=2.0,
-            coverage_threshold_zeta=self.settings.safety_gate.coverage_threshold_zeta
+    def run_benchmark_experiment(
+        self,
+        task_name: str = "GSM8K",
+        sample_limit: int = 0,
+        num_samples: int = 16,
+        ensemble_sizes: Sequence[int] = DEFAULT_ENSEMBLE_SIZES,
+        run_mode: str = "paper",
+        cache_path: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], float, List[Dict[str, Any]]]:
+        sizes = parse_ensemble_sizes(ensemble_sizes)
+        validate_protocol(run_mode, task_name, sample_limit, num_samples, sizes)
+        samples = self.loader.load_any_dataset(task_name, sample_limit)
+        if not samples:
+            raise ValueError(f"No samples loaded for {task_name}")
+        dataset_fingerprint = self.loader.dataset_fingerprint(task_name)
+        generation_cache, cache_sha256, model_metadata = self._prepare_generation_cache(
+            task_name, samples, num_samples, run_mode, dataset_fingerprint, cache_path
         )
-        router_batch_data = [
-            {"sample_id": item["sample_id"], "p_wrong": item["p_wrong"], "syntax_valid": 1, "coverage": 1.0, "trajectory_text": item["trajectory_text"]}
-            for item in ensemble_path_inputs
-        ]
-        
-        active_verifiers = [verifier_id]
-        routing_decisions = router.route_batch(router_batch_data, active_verifiers=active_verifiers)
+        verifier = self.verifier_mgr.verifiers[_verifier_id(task_name)]
 
-        correct_under_router = 0
-        total_under_router = len(ensemble_path_inputs)
-        total_cost_spent = 0.0
-        for decision in routing_decisions:
-            s_id = decision["sample_id"]
-            action = decision["action"]
-            item = next(x for x in ensemble_path_inputs if x["sample_id"] == s_id)
-            total_cost_spent += sum(decision["actual_cost_vector"])
-            if action == "verify" and item["is_correct"]:
-                correct_under_router += 1
-            elif action == "trust" and item["is_correct"]:
-                correct_under_router += 1
-
-        experiment_results["routing_diagnostics"] = {
-            "selected_engine": task_name,
-            "total_samples": total_under_router,
-            "router_final_accuracy": round(correct_under_router / total_under_router * 100, 2),
-            "total_cost_vector_budget_spent": round(total_cost_spent, 2)
+        labels_by_n: Dict[int, List[int]] = {size: [] for size in sizes}
+        scores_by_n: Dict[int, Dict[str, List[float]]] = {
+            size: {"PWSC": [], "Mean NLL": [], "Worst-5 NLL": []} for size in sizes
         }
-
-        # 拓扑不变量实证诊断
-        proof_report = {
-            "correct_msg": float(np.mean(diagnostic_metrics["correct_group"]["msg"])),
-            "incorrect_msg": float(np.mean(diagnostic_metrics["incorrect_group"]["msg"])),
-            "correct_mso": float(np.mean(diagnostic_metrics["correct_group"]["mso"])),
-            "incorrect_mso": float(np.mean(diagnostic_metrics["incorrect_group"]["mso"])),
-            "correct_sbp": float(np.mean(diagnostic_metrics["correct_group"]["sbp"])),
-            "incorrect_sbp": float(np.mean(diagnostic_metrics["incorrect_group"]["sbp"])),
-            "correct_hodge_ex": float(np.mean(diagnostic_metrics["correct_group"]["hodge_ex"])),
-            "incorrect_hodge_ex": float(np.mean(diagnostic_metrics["incorrect_group"]["hodge_ex"])),
-            "correct_hodge_coex": float(np.mean(diagnostic_metrics["correct_group"]["hodge_coex"])),
-            "incorrect_hodge_coex": float(np.mean(diagnostic_metrics["incorrect_group"]["hodge_coex"])),
-            "correct_cech": float(np.mean(diagnostic_metrics["correct_group"]["cech_obs"])),
-            "incorrect_cech": float(np.mean(diagnostic_metrics["incorrect_group"]["cech_obs"]))
+        for size in sizes:
+            if size > 1:
+                scores_by_n[size].update({"Self-Consistency": [], "Semantic Entropy": [], "MBR": []})
+        selection_correct_by_n: Dict[int, Dict[str, List[bool]]] = {
+            size: {"First Path": [], "PWSC": [], "Self-Consistency": [], "MBR": []} for size in sizes
         }
+        diagnostic_groups: Dict[int, Dict[str, List[float]]] = {
+            size: {"correct": [], "incorrect": []} for size in sizes
+        }
+        rows: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
 
-        try:
-            from scipy.stats import pearsonr
-            r_mso_val, _ = pearsonr(mso_all, y_true_ensemble)
-            if np.isnan(r_mso_val):
-                r_mso_val = 0.45
-        except Exception:
-            r_mso_val = float(np.corrcoef(mso_all, y_true_ensemble)[0, 1])
-            if np.isnan(r_mso_val):
-                r_mso_val = 0.45
+        records: Iterable[Tuple[TaskSample, List[Dict[str, Any]]]] = self._iter_generation_cache(generation_cache, samples)
+        if tqdm:
+            records = tqdm(records, total=len(samples), desc=f"PWSC paper evaluation: {task_name}")
+        for sample, traces in records:
+            if not _trace_batch_complete(traces, num_samples):
+                reason = "incomplete_text_or_logprobs"
+                if run_mode == "paper":
+                    raise RuntimeError(f"publication run aborted at {sample.sample_id}: {reason}")
+                skipped.append({"sample_id": sample.sample_id, "reason": reason})
+                continue
+            traces = traces[:num_samples]
+            texts = [str(trace["text"]) for trace in traces]
+            logprob_paths = [filter_reasoning_logprobs_full(trace["logprobs"]) for trace in traces]
+            metadata = _sample_metadata(sample, task_name)
+            correctness_cache: Dict[int, bool] = {}
 
-        return experiment_results, proof_report, r_mso_val, intermediate_rows
+            def is_correct(index: int) -> bool:
+                if index not in correctness_cache:
+                    correctness_cache[index] = verifier.execute(texts[index], sample.gold_answer, metadata)
+                return correctness_cache[index]
+
+            base_correct = is_correct(0)
+            base_wrong = int(not base_correct)
+            mean_nll = SCSVBaselines.calculate_nll(logprob_paths[0])
+            worst_nll = SCSVBaselines.calculate_worst_k_nll(logprob_paths[0], self.settings.pwsc.weakest_k)
+
+            for size in sizes:
+                prefix_texts = texts[:size]
+                prefix_logprobs = logprob_paths[:size]
+                risk, diagnostics = self.risk_estimator.score(
+                    prefix_logprobs,
+                    prefix_texts,
+                    task_name,
+                    [metadata] * size,
+                )
+                outcomes = diagnostics["outcomes"]
+                confidences = diagnostics["q"]
+                pwsc_index = int(diagnostics["selected_index"])
+                sc_index = _majority_index(outcomes, confidences)
+                mbr_index = _mbr_index(diagnostics["kernel"], diagnostics.get("weights"))
+                sc_risk = SCSVBaselines.calculate_self_consistency(prefix_texts, outcomes)
+                se_risk = SCSVBaselines.calculate_semantic_entropy(prefix_texts, outcomes)
+                mbr_risk = SCSVBaselines.calculate_mbr(diagnostics["kernel"], diagnostics.get("weights"))
+
+                labels_by_n[size].append(base_wrong)
+                scores_by_n[size]["PWSC"].append(float(risk))
+                scores_by_n[size]["Mean NLL"].append(mean_nll)
+                scores_by_n[size]["Worst-5 NLL"].append(worst_nll)
+                if size > 1:
+                    scores_by_n[size]["Self-Consistency"].append(sc_risk)
+                    scores_by_n[size]["Semantic Entropy"].append(se_risk)
+                    scores_by_n[size]["MBR"].append(mbr_risk)
+                selection_correct_by_n[size]["First Path"].append(base_correct)
+                selection_correct_by_n[size]["PWSC"].append(is_correct(pwsc_index))
+                selection_correct_by_n[size]["Self-Consistency"].append(is_correct(sc_index))
+                selection_correct_by_n[size]["MBR"].append(is_correct(mbr_index))
+                group = "correct" if base_correct else "incorrect"
+                diagnostic_groups[size][group].append(float(diagnostics["normalized_spectral_uncertainty"]))
+                rows.append(
+                    {
+                        "sample_id": sample.sample_id,
+                        "task": task_name,
+                        "ensemble_size": size,
+                        "base_is_correct": base_correct,
+                        "pwsc_risk": float(risk),
+                        "mean_nll": mean_nll,
+                        "worst_5_nll": worst_nll,
+                        "self_consistency_risk": sc_risk if size > 1 else None,
+                        "semantic_entropy_risk": se_risk if size > 1 else None,
+                        "mbr_risk": mbr_risk if size > 1 else None,
+                        "pwsc_selected_index": pwsc_index,
+                        "pwsc_selected_is_correct": is_correct(pwsc_index),
+                        "sc_selected_index": sc_index,
+                        "sc_selected_is_correct": is_correct(sc_index),
+                        "mbr_selected_index": mbr_index,
+                        "mbr_selected_is_correct": is_correct(mbr_index),
+                        "valid_path_count": int(diagnostics["valid_count"]),
+                        "spectral_uncertainty": float(diagnostics["normalized_spectral_uncertainty"]),
+                        "mean_path_confidence": float(diagnostics["mean_path_confidence"]),
+                    }
+                )
+
+        scored_questions = len(labels_by_n[sizes[0]])
+        if scored_questions == 0:
+            raise RuntimeError(f"All {len(samples)} samples failed before scoring")
+        if run_mode == "paper" and (skipped or scored_questions != len(samples)):
+            raise RuntimeError("paper mode requires complete coverage with zero skipped questions")
+
+        methods_by_n: Dict[str, Dict[str, Any]] = {}
+        paired_by_n: Dict[str, Dict[str, Any]] = {}
+        selection_by_n: Dict[str, Dict[str, float]] = {}
+        diagnostics_by_n: Dict[str, Dict[str, Any]] = {}
+        for size in sizes:
+            key = f"N={size}"
+            labels = labels_by_n[size]
+            methods_by_n[key] = {
+                name: compute_academic_metrics(labels, values, seed=self.settings.random_seed)
+                for name, values in scores_by_n[size].items()
+            }
+            paired_by_n[key] = {}
+            for name, values in scores_by_n[size].items():
+                if name == "PWSC":
+                    continue
+                paired_by_n[key][f"PWSC - {name}"] = {
+                    "AUROC": ScientificSignalAnalyzer.paired_bootstrap_difference(
+                        labels,
+                        scores_by_n[size]["PWSC"],
+                        values,
+                        ScientificSignalAnalyzer.calculate_auroc,
+                        seed=self.settings.random_seed,
+                        n_bootstrap=BOOTSTRAP_SAMPLES,
+                    ),
+                    "AURC": ScientificSignalAnalyzer.paired_bootstrap_difference(
+                        labels,
+                        scores_by_n[size]["PWSC"],
+                        values,
+                        ScientificSignalAnalyzer.calculate_aurc,
+                        seed=self.settings.random_seed,
+                        n_bootstrap=BOOTSTRAP_SAMPLES,
+                    ),
+                }
+            selection_by_n[key] = {
+                name: float(np.mean(values)) for name, values in selection_correct_by_n[size].items()
+            }
+            diagnostics_by_n[key] = self._spectral_report(diagnostic_groups[size])
+
+        max_size = sizes[-1]
+        max_key = f"N={max_size}"
+        correlation = ScientificSignalAnalyzer.calculate_pearson_correlation(
+            diagnostic_groups[max_size]["correct"] + diagnostic_groups[max_size]["incorrect"],
+            [0] * len(diagnostic_groups[max_size]["correct"]) + [1] * len(diagnostic_groups[max_size]["incorrect"]),
+        )
+        proof_report = dict(diagnostics_by_n[max_key])
+        proof_report["spectral_uncertainty_error_correlation"] = correlation
+        proof_report["skipped_samples"] = skipped
+        publication_reasons: List[str] = []
+        if run_mode != "paper":
+            publication_reasons.append(f"run_mode={run_mode}")
+        if task_name not in PRIMARY_TASKS:
+            publication_reasons.append("not a primary task")
+        if sample_limit != 0:
+            publication_reasons.append("partial dataset")
+        if tuple(sizes) != DEFAULT_ENSEMBLE_SIZES or num_samples != 16:
+            publication_reasons.append("non-canonical ensemble protocol")
+        if skipped or scored_questions != len(samples):
+            publication_reasons.append("incomplete sample coverage")
+
+        report = {
+            "method": self.settings.pwsc.method_version,
+            "task": task_name,
+            "run_mode": run_mode,
+            "publication_eligible": not publication_reasons,
+            "publication_ineligibility_reasons": publication_reasons,
+            "n_requested": len(samples),
+            "n_scored_questions": scored_questions,
+            "n_skipped": len(skipped),
+            "evaluation_target": "correctness of the fixed first sampled path for every UQ method",
+            "Methods by N": methods_by_n,
+            "Selection Accuracy by N": selection_by_n,
+            "Paired Bootstrap Differences by N": paired_by_n,
+            "Diagnostics by N": diagnostics_by_n,
+            # Compatibility views for downstream table scripts.
+            "Single-Path Methods": methods_by_n["N=1"],
+            "Multi-Path Methods": methods_by_n[max_key],
+            "run_metadata": {
+                "seed": self.settings.random_seed,
+                "model_identifier": self.model_name,
+                "model_revision": model_metadata.get("resolved_revision"),
+                "model_metadata": model_metadata,
+                "model_endpoint": self.model_url,
+                "requested_top_logprobs": self.top_k,
+                "system_prompt_sha256": hashlib.sha256(
+                    self.generator._system_prompt(task_name).encode("utf-8")
+                ).hexdigest(),
+                "weakest_k": self.settings.pwsc.weakest_k,
+                "num_samples": num_samples,
+                "ensemble_sizes": list(sizes),
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+                "max_workers": self.max_workers,
+                "generation_batch_size": self.generation_batch_size,
+                "bootstrap_samples": BOOTSTRAP_SAMPLES,
+                "dataset_root": str(self.loader.base_dir),
+                "dataset_fingerprint": dataset_fingerprint,
+                "generation_cache_path": str(generation_cache),
+                "generation_cache_sha256": cache_sha256,
+                "input_sample_sha256": _input_sha256(samples),
+            },
+            "diagnostics": proof_report,
+            "notes": [
+                "All UQ methods use the same fixed first-path error labels for paired comparison.",
+                "Answer-selection accuracy is reported separately and does not change UQ labels.",
+                "Scores are raw risks; ECE/Brier require a disjoint labeled dev calibrator.",
+                "No test-set min-max normalization or majority-vote relabeling is used.",
+            ],
+        }
+        return report, proof_report, correlation, rows
+
+    @staticmethod
+    def _spectral_report(groups: Dict[str, List[float]]) -> Dict[str, Any]:
+        correct, incorrect = groups["correct"], groups["incorrect"]
+        result: Dict[str, Any] = {
+            "correct_mean": float(np.mean(correct)) if correct else float("nan"),
+            "incorrect_mean": float(np.mean(incorrect)) if incorrect else float("nan"),
+            "correct_n": len(correct),
+            "incorrect_n": len(incorrect),
+            "welch_t": float("nan"),
+            "welch_p": float("nan"),
+        }
+        if correct and incorrect and (np.std(correct) > 0 or np.std(incorrect) > 0):
+            try:
+                from scipy.stats import ttest_ind
+
+                stat, pvalue = ttest_ind(correct, incorrect, equal_var=False, nan_policy="omit")
+                result["welch_t"], result["welch_p"] = float(stat), float(pvalue)
+            except Exception:
+                pass
+        return result
 
 
 def print_final_academic_table(report: Dict[str, Any], task_type: str, num_samples: int) -> None:
-    print("\n" + "=" * 115)
-    print(f"      🏆  FR-PA & EPA v5.0: UNIFIED GEOMETRIC top-K UNCERTAINTY MATRIX  🏆")
-    print(f"      Task Domain: {task_type} | Deployment: UNIFIED vLLM MODE (CSSV Sheaf, N={num_samples})")
-    print("=" * 115)
-    print(f"| {'Method (Conformally Aligned?)':<32} | {'AUROC (↑)':<10} | {'AUPRC (↑)':<10} | {'ECE (↓)':<10} | {'Brier (↓)':<10} | {'Top-50% ACC (↑)':<14} |")
-    print("-" * 115)
-    
-    print("| \033[94m--- [Single-Path Methods (N=1) Base Group] ---\033[0m")
-    single_group = report.get("Single-Path Methods", {})
-    if "LDAS / FIM (Ours-Single)" in single_group:
-        metrics = single_group["LDAS / FIM (Ours-Single)"]
-        print(f"| \033[92m{'Ours (Single)':<30} (N=1)\033[0m | \033[92m{metrics['AUROC']*100:8.2f}%\033[0m | \033[92m{metrics['AUPRC']*100:8.2f}%\033[0m | \033[92m{metrics['ECE']:10.4f}\033[0m | \033[92m{metrics['Brier']:10.4f}\033[0m | \033[92m{metrics['Top-50% ACC']*100:12.2f}%\033[0m |")
-    
-    for b_name, metrics in single_group.items():
-        if "Ours" in b_name:
-            continue
-        print(f"| {b_name:<30} (N=1) | {metrics['AUROC']*100:8.2f}% | {metrics['AUPRC']*100:8.2f}% | {metrics['ECE']:10.4f} | {metrics['Brier']:10.4f} | {metrics['Top-50% ACC']*100:12.2f}% |")
-              
-    print("-" * 115)
-    print("| \033[94m--- [Multi-Path Methods (N=%d) Ensemble Group] ---\033[0m" % num_samples)
-    multi_group = report.get("Multi-Path Methods", {})
-    if "EPA / FIM (Ours-Ensemble)" in multi_group:
-        metrics = multi_group["EPA / FIM (Ours-Ensemble)"]
-        print(f"| \033[92m{'Ours (Ensemble)':<30} (N={num_samples})\033[0m | \033[92m{metrics['AUROC']*100:8.2f}%\033[0m | \033[92m{metrics['AUPRC']*100:8.2f}%\033[0m | \033[92m{metrics['ECE']:10.4f}\033[0m | \033[92m{metrics['Brier']:10.4f}\033[0m | \033[92m{metrics['Top-50% ACC']*100:12.2f}%\033[0m |")
-              
-    for b_name, metrics in multi_group.items():
-        if "Ours-Ensemble" in b_name:
-            continue
-        print(f"| {b_name:<30} (N={num_samples}) | {metrics['AUROC']*100:8.2f}% | {metrics['AUPRC']*100:8.2f}% | {metrics['ECE']:10.4f} | {metrics['Brier']:10.4f} | {metrics['Top-50% ACC']*100:12.2f}% |")
-            
-    print("-" * 115)
-    diag = report.get("routing_diagnostics", {})
-    print(f"| \033[94m[Multi-Dim Router Decision Utility]\033[0m : Budget-Aware Accuracy: \033[94m{diag.get('router_final_accuracy')}% | Spent: {diag.get('total_cost_vector_budget_spent')} units\033[0m")
-    print("=" * 115 + "\n")
+    print("\n" + "=" * 98)
+    print(
+        f"PWSC v1.0 | mode={report['run_mode']} | task={task_type} | "
+        f"publication_eligible={report['publication_eligible']}"
+    )
+    print("Fixed first-path correctness labels; answer-selection accuracy is reported separately.")
+    print("=" * 98)
+    for size_key, methods in report["Methods by N"].items():
+        print(f"[{size_key}]  {'Method':<25} {'AUROC':>10} {'AUPRC':>10} {'AURC':>10} {'SelAcc@50':>12}")
+        for name, metrics in methods.items():
+            def fmt(metric: str) -> str:
+                value = metrics.get(metric)
+                return "NA" if value is None or not np.isfinite(value) else f"{value:.4f}"
+
+            print(
+                f"{'':7}{name:<25} {fmt('AUROC'):>10} {fmt('AUPRC'):>10} "
+                f"{fmt('AURC'):>10} {fmt('SelectiveAcc@50'):>12}"
+            )
+        selection = report["Selection Accuracy by N"][size_key]
+        selection_text = ", ".join(f"{name}={value:.4f}" for name, value in selection.items())
+        print(f"{'':7}Selection accuracy: {selection_text}")
+        print("-" * 98)
+    print("=" * 98 + "\n")
 
 
-def print_hypothesis_proof_table(proof: Dict[str, Any], r_mso: float) -> None:
-    print("=" * 100)
-    print(f"      🧬  QSFT v7.5-ZeroParam: CONTINUOUS DOUBLE-HOMOTOPY CONVERGENCE PROOF  🧬")
-    print("=" * 100)
-    print(f"| {'Hypothesis Metric':<35} | {'Correct Group (y=0)':<21} | {'Incorrect Group (y=1)':<21} | {'Proving Status':<15} |")
-    print("-" * 100)
-    print(f"| 1a. Classical Action (Mean NLL)       | \033[92m{proof['correct_msg']:>21.4f}\033[0m | {proof['incorrect_msg']:>21.4f} | \033[92mPROVED (p<0.01)\033[0m |")
-    print(f"| 2a. Von Neumann Spectral Entropy H_VN | {proof['correct_mso']:>21.4f} | \033[91m{proof['incorrect_mso']:>21.4f}\033[0m | \033[92mPROVED (p<0.01)\033[0m |")
-    print(f"| 3a. Continuous Conformal Ambiguity     | {proof['correct_sbp']:>21.4f} | \033[91m{proof['incorrect_sbp']:>21.4f}\033[0m | \033[92mPROVED (p<0.01)\033[0m |")
-    print(f"| 3b. Spectral Entropy-Error Pearson r  | \033[92m{r_mso:>43.4f}\033[0m | \033[92mPROVED (p<0.01)\033[0m |")
-    print("=" * 100 + "\n")
-def save_results_to_csv(task_name: str, intermediate_rows: List[Dict[str, Any]], report_dict: Dict[str, Any]) -> None:
-    timestamp = int(time.time())
-    os.makedirs("diagnostics/logs", exist_ok=True)
-    inter_path = f"diagnostics/logs/intermediate_results_{task_name}_{timestamp}.csv"
-    with open(inter_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "sample_id", "raw_question", "gold_answer", "single_is_correct", 
-            "single_p_wrong_score", "single_calibrated_p_wrong", 
-            "ensemble_is_correct", "ensemble_p_wrong_score", "ensemble_calibrated_p_wrong",
-            "msg_spectral_gap", "mso_spectral_obstruction"
-        ])
+def print_hypothesis_proof_table(proof: Dict[str, Any], correlation: float) -> None:
+    print("PWSC diagnostics (descriptive; no hard-coded significance claims)")
+    print(f"  spectral uncertainty, correct mean:   {proof.get('correct_mean')}")
+    print(f"  spectral uncertainty, incorrect mean: {proof.get('incorrect_mean')}")
+    print(f"  Welch p-value:                         {proof.get('welch_p')}")
+    print(f"  uncertainty/error correlation:         {correlation}")
+
+
+def save_results_to_csv(
+    task_name: str,
+    intermediate_rows: List[Dict[str, Any]],
+    report_dict: Dict[str, Any],
+    seed: int = 0,
+    command: Optional[Sequence[str]] = None,
+    output_dir: Optional[str] = None,
+) -> Dict[str, str]:
+    if output_dir:
+        root = Path(output_dir).expanduser().resolve()
+    else:
+        root = Path(__file__).resolve().parent / "diagnostics" / f"{report_dict['run_mode']}_runs"
+    root.mkdir(parents=True, exist_ok=True)
+    run_id = time.time_ns()
+    csv_path = root / f"sample_results_{task_name}_{run_id}.csv"
+    fields = sorted({key for row in intermediate_rows for key in row})
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
-        for row in intermediate_rows:
-            clean_row = row.copy()
-            writer.writerow(clean_row)
-    logger.info(f"Intermediate sample-level data written to: {inter_path}")
+        writer.writerows(intermediate_rows)
+    package_versions = {}
+    for package in ("numpy", "scipy", "pandas", "openai", "httpx", "evalplus", "math-verify"):
+        try:
+            package_versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            package_versions[package] = None
+    report_path = root / f"report_{task_name}_{run_id}.json"
+    report_path.write_text(json.dumps(_json_safe(report_dict), indent=2, ensure_ascii=False), encoding="utf-8")
+    run_metadata = report_dict["run_metadata"]
+    manifest = {
+        "method": report_dict["method"],
+        "run_mode": report_dict["run_mode"],
+        "publication_eligible": report_dict["publication_eligible"],
+        "publication_ineligibility_reasons": report_dict["publication_ineligibility_reasons"],
+        "task": task_name,
+        "seed": seed,
+        "command": _redact_command(command or sys.argv),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "packages": package_versions,
+        "model_identifier": run_metadata["model_identifier"],
+        "model_revision": run_metadata["model_revision"],
+        "model_metadata": run_metadata["model_metadata"],
+        "dataset_fingerprint": run_metadata["dataset_fingerprint"],
+        "sampling": {
+            key: run_metadata[key]
+            for key in (
+                "num_samples",
+                "ensemble_sizes",
+                "temperature",
+                "max_tokens",
+                "requested_top_logprobs",
+                "system_prompt_sha256",
+                "weakest_k",
+            )
+        },
+        "evaluation": {
+            "target": report_dict["evaluation_target"],
+            "bootstrap_samples": run_metadata["bootstrap_samples"],
+        },
+        "input_sample_sha256": run_metadata["input_sample_sha256"],
+        "generation_cache_path": run_metadata["generation_cache_path"],
+        "generation_cache_sha256": run_metadata["generation_cache_sha256"],
+        "sample_rows": len(intermediate_rows),
+        "csv_path": str(csv_path),
+        "csv_sha256": _sha256_file(csv_path),
+        "report_path": str(report_path),
+        "report_sha256": _sha256_file(report_path),
+        "created_unix": time.time(),
+    }
+    manifest_path = root / f"manifest_{task_name}_{run_id}.json"
+    manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info("Wrote sample results: %s", csv_path)
+    logger.info("Wrote report: %s", report_path)
+    logger.info("Wrote manifest: %s", manifest_path)
+    return {"csv": str(csv_path), "report": str(report_path), "manifest": str(manifest_path)}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="PWSC publication experiment pipeline.")
+    parser.add_argument("--mode", choices=["paper", "stress", "smoke"], default="paper")
+    parser.add_argument(
+        "--task",
+        default="GSM8K",
+        choices=["GSM8K", "HumanEvalPlus", "AIME2025", "AIME2026", "FOLIO", "P-FOLIO", "LiveCodeBench", "MATH-500"],
+    )
+    parser.add_argument("--limit", type=int, default=0, help="0 means the complete split; positive limits require smoke mode")
+    parser.add_argument("--seed", type=int, default=20260615)
+    parser.add_argument("--model_url", default="http://127.0.0.1:8000/v1")
+    parser.add_argument("--model_name", default="deepseek")
+    parser.add_argument("--expected_model_revision", default="")
+    parser.add_argument("--api_key", default="empty")
+    parser.add_argument("--dataset_root", default="/data/newmodel/graphunagent/datasets")
+    parser.add_argument("--top_k", type=int, default=10, help="API top-logprobs request; PWSC weakest-K remains frozen at 5")
+    parser.add_argument("--num_samples", type=int, default=16)
+    parser.add_argument("--ensemble_sizes", default="1,4,8,16")
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--max_tokens", type=int, default=12000)
+    parser.add_argument("--max_workers", type=int, default=8)
+    parser.add_argument("--generation_batch_size", type=int, default=32)
+    parser.add_argument("--cache_path", default="", help="reuse a complete schema-v2 generation cache and skip API generation")
+    parser.add_argument("--output_dir", default="")
+    parser.add_argument("--preflight", action="store_true", help="validate protocol/model/data/cache without generation")
+    return parser
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ISE-Flow Universal Dataset Pipeline.")
-    parser.add_argument("--task", type=str, default="GSM8K", 
-                        choices=["GSM8K", "HumanEvalPlus", "AIME2025", "AIME2026", "FOLIO", "P-FOLIO", "LiveCodeBench", "MATH-500"])
-    parser.add_argument("--limit", type=int, default=15)
-    parser.add_argument("--seed", type=int, default=20260615)
-    parser.add_argument("--model_url", type=str, default="http://127.0.0.1:8000/v1")
-    parser.add_argument("--model_name", type=str, default="deepseek")
-    parser.add_argument("--api_key", type=str, default="empty")
-    parser.add_argument("--top_k", type=int, default=10)
-    parser.add_argument("--num_samples", type=int, default=16)
-
-    args = parser.parse_args()
-    
+    args = build_parser().parse_args()
+    sizes = parse_ensemble_sizes(args.ensemble_sizes)
+    validate_protocol(args.mode, args.task, args.limit, args.num_samples, sizes)
     random.seed(args.seed)
     np.random.seed(args.seed)
-
-    exp_settings = ExperimentSettings(
-        random_seed=args.seed,
-        use_calibration=True
-    )
-
+    settings = ExperimentSettings(random_seed=args.seed, use_calibration=False)
     runner = AcademicExperimentRunner(
-        settings=exp_settings,
+        settings=settings,
         model_name=args.model_name,
         model_url=args.model_url,
         api_key=args.api_key,
-        top_k=args.top_k
+        top_k=args.top_k,
+        dataset_root=args.dataset_root,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        max_workers=args.max_workers,
+        generation_batch_size=args.generation_batch_size,
+        expected_model_revision=args.expected_model_revision,
     )
-
     try:
-        results, proof_report, r_mso_val, intermediate_rows = runner.run_benchmark_experiment(
+        if args.preflight:
+            result = runner.preflight(
+                args.task,
+                args.limit,
+                args.num_samples,
+                sizes,
+                args.mode,
+                args.cache_path or None,
+            )
+            print(json.dumps(_json_safe(result), indent=2, ensure_ascii=False))
+            return
+        report, proof, correlation, rows = runner.run_benchmark_experiment(
             task_name=args.task,
             sample_limit=args.limit,
-            num_samples=args.num_samples
+            num_samples=args.num_samples,
+            ensemble_sizes=sizes,
+            run_mode=args.mode,
+            cache_path=args.cache_path or None,
         )
-        print_final_academic_table(results, args.task, args.num_samples)
-        print_hypothesis_proof_table(proof_report, r_mso_val)
-        save_results_to_csv(args.task, intermediate_rows, results)
-        
-    except Exception as e:
-        logger.critical(f"Global pipeline crash: {str(e)}", exc_info=True)
-        sys.exit(1)
+        print_final_academic_table(report, args.task, args.num_samples)
+        print_hypothesis_proof_table(proof, correlation)
+        save_results_to_csv(
+            args.task,
+            rows,
+            report,
+            seed=args.seed,
+            command=sys.argv,
+            output_dir=args.output_dir or None,
+        )
+    except Exception as exc:
+        logger.critical("Pipeline failed without fabricating results: %s", exc, exc_info=True)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

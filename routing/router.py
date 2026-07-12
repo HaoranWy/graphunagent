@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""ISE-Flow 批处理多维预算分配与成本敏感路由器.
+"""Optional batch router for separately calibrated deployment scores.
 
-本模块基于不确定性概率标定与多维向量预算限制，实现全局性价比（VCR）排序分发，
-并在预算告急时自适应执行期望损失最小化兜底决策 [PDF Page 4, 5, 8]。
+This module is excluded from the PWSC benchmark tables.  It accepts only a
+probability fitted on a disjoint development set, never the raw PWSC score.
 """
 
 import logging
@@ -80,6 +80,11 @@ class BatchRouter:
         candidate_actions: List[Dict[str, Any]] = []
 
         for sample in batch_data:
+            if sample.get("is_calibrated_probability") is not True:
+                raise ValueError(
+                    "BatchRouter requires a dev-calibrated probability and "
+                    "is_calibrated_probability=True"
+                )
             p_w = sample["p_wrong"]
             syntax_valid = sample.get("syntax_valid", 1)
             coverage = sample.get("coverage", 1.0)

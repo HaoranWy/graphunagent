@@ -10,6 +10,15 @@ from typing import Dict, List, Tuple
 
 
 @dataclass(frozen=True)
+class PWSCConfig:
+    """Frozen algorithm constants shared by all benchmark runs."""
+
+    weakest_k: int = 5
+    calibration_split: str = "dev_only"
+    method_version: str = "PWSC-v1.0"
+
+
+@dataclass(frozen=True)
 class RISEWeightsConfig:
     """ISE 综合结构风险分数（R_ISE）融合权重.
     
@@ -50,10 +59,11 @@ class ExperimentSettings:
     rise_weights: RISEWeightsConfig = field(default_factory=RISEWeightsConfig)
     cost_budget: CostBudgetConfig = field(default_factory=CostBudgetConfig)
     safety_gate: SafetyGateConfig = field(default_factory=SafetyGateConfig)
+    pwsc: PWSCConfig = field(default_factory=PWSCConfig)
 
     # 运行基本配置
     random_seed: int = 2048    # 保持严格学术复现的固定全局种子
-    use_calibration: bool = True    # 测试阶段是否默认启用分桶概率校准
+    use_calibration: bool = False   # Calibration is opt-in and dev-only.
     
     def to_dict(self) -> Dict[str, any]:
         """将当前实验的所有静态配置转化为字典，用于诊断模块 tracker 的序列化输出."""

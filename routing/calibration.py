@@ -1,71 +1,91 @@
-# -*- coding: utf-8 -*-
-"""ISE-Flow 全任务域极性本征安全对齐的 Platt-Beta 校准器."""
+"""Development-only monotone Platt calibration for PWSC risk scores."""
 
-import bisect
+from __future__ import annotations
+
 import math
-import logging
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
-logger = logging.getLogger("ise_flow.routing.calibration")
 
+class DevPlattCalibrator:
+    """Fit ``P(error|score)`` using labeled development data only."""
 
-class PriorConditionedCalibrator:
-    """极性单调本征安全 Platt-Beta 标定器."""
-
-    def __init__(self, mu_0: float = 0.15, max_iter: int = 100, tol: float = 1e-6) -> None:
-        self.mu_0 = float(np.clip(mu_0, 0.01, 0.99))
-        self.max_iter = max_iter
-        self.tol = tol
-        
-        self.w: float = 1.0
-        self.b: float = 0.0
+    def __init__(self, l2: float = 1e-4, max_iter: int = 500) -> None:
+        self.l2 = float(l2)
+        self.max_iter = int(max_iter)
+        self.center = 0.0
+        self.scale = 1.0
+        self.weight = 1.0
+        self.bias = 0.0
         self.is_fitted = False
 
-    def fit(self, scores: List[float], unsupervised_reference: Optional[List[float]] = None, mso_scores: Optional[List[float]] = None) -> Tuple[float, float]:
-        if not scores:
-            raise ValueError("Scores list cannot be empty.")
-            
-        F = np.array(scores, dtype=np.float64)
-        std_f = np.std(F) if np.std(F) > 1e-6 else 1.0
-        
-        mean_mso = 0.05
-        if mso_scores is not None and len(mso_scores) == len(scores):
-            mean_mso = float(np.mean(mso_scores))
-            self.mu_0 = float(np.clip(mean_mso * 2.5 + 0.02, 0.05, 0.70))
-            logger.info(f"OOD Calibration: dynamic mu_0 aligned to {self.mu_0:.4f} via MSO mean = {mean_mso:.4f}")
+    def fit(
+        self,
+        scores: Sequence[float],
+        labels: Sequence[int],
+        split_name: str = "dev",
+    ) -> Tuple[float, float]:
+        split = split_name.strip().lower()
+        if "test" in split or not any(name in split for name in ("dev", "val", "calib")):
+            raise ValueError("Calibration may only be fitted on a declared dev/validation split")
+        x = np.asarray(scores, dtype=np.float64)
+        y = np.asarray(labels, dtype=np.float64)
+        if x.ndim != 1 or y.ndim != 1 or x.size != y.size or x.size < 4:
+            raise ValueError("scores and labels must be aligned one-dimensional arrays with at least four samples")
+        if not np.all(np.isfinite(x)) or not set(np.unique(y)).issubset({0.0, 1.0}) or np.unique(y).size < 2:
+            raise ValueError("Calibration requires finite scores and both binary error labels")
+        self.center = float(np.mean(x))
+        self.scale = float(np.std(x)) or 1.0
+        z = (x - self.center) / self.scale
 
-        # ----------------- 极性本征安全 -----------------
-        # 得益于自监督语义密度与有理质量度规的联合全域单调性，标定极性恒为正向，物理清零繁冗实体
-        sign = 1.0
-        self.w = sign / (std_f + 0.2)
+        from scipy.optimize import minimize
 
-        b_min, b_max = -50.0, 50.0
-        b_curr = 0.0
+        prevalence = float(np.clip(np.mean(y), 1e-4, 1.0 - 1e-4))
+        initial = np.asarray([0.0, math.log(prevalence / (1.0 - prevalence))], dtype=np.float64)
 
-        for _ in range(self.max_iter):
-            b_curr = (b_min + b_max) / 2.0
-            z = self.w * F + b_curr
-            p = 1.0 / (1.0 + np.exp(-np.clip(z, -20.0, 20.0)))
-            
-            g_b = np.mean(p) - self.mu_0
-            if abs(g_b) < self.tol or (b_max - b_min) < 1e-7:
-                break
-                
-            if g_b > 0:
-                b_max = b_curr
-            else:
-                b_min = b_curr
+        def objective(params: np.ndarray) -> Tuple[float, np.ndarray]:
+            # exp(theta) makes the mapping monotonically increasing in risk.
+            theta, bias = float(params[0]), float(params[1])
+            weight = math.exp(float(np.clip(theta, -10.0, 10.0)))
+            logits = np.clip(weight * z + bias, -30.0, 30.0)
+            probs = 1.0 / (1.0 + np.exp(-logits))
+            loss = -float(np.mean(y * np.log(probs + 1e-12) + (1.0 - y) * np.log(1.0 - probs + 1e-12)))
+            loss += 0.5 * self.l2 * theta * theta
+            residual = probs - y
+            gradient = np.asarray([
+                float(np.mean(residual * z) * weight + self.l2 * theta),
+                float(np.mean(residual)),
+            ])
+            return loss, gradient
 
-        self.b = float(b_curr)
+        result = minimize(
+            lambda params: objective(params)[0],
+            initial,
+            jac=lambda params: objective(params)[1],
+            method="L-BFGS-B",
+            options={"maxiter": self.max_iter},
+        )
+        if not result.success:
+            raise RuntimeError(f"Platt calibration failed: {result.message}")
+        self.weight = math.exp(float(np.clip(result.x[0], -10.0, 10.0)))
+        self.bias = float(result.x[1])
         self.is_fitted = True
-        logger.info(f"Platt-Beta calibration complete: solved w = {self.w:.4f} | b = {self.b:.4f}")
-        return self.w, self.b
+        return self.weight, self.bias
 
     def calibrate(self, score: float) -> float:
         if not self.is_fitted:
-            return float(1.0 / (1.0 + math.exp(-score)))
-        z = self.w * score + self.b
-        prob = 1.0 / (1.0 + math.exp(-np.clip(z, -20.0, 20.0)))
-        return float(np.clip(prob, 0.01, 0.99))
+            raise RuntimeError("Calibrator must be fitted on labeled development data first")
+        normalized = (float(score) - self.center) / self.scale
+        logit = float(np.clip(self.weight * normalized + self.bias, -30.0, 30.0))
+        return float(1.0 / (1.0 + math.exp(-logit)))
+
+    def calibrate_many(self, scores: Sequence[float]) -> List[float]:
+        return [self.calibrate(score) for score in scores]
+
+
+# Backward-compatible import name.  Its semantics are now explicitly dev-only.
+PriorConditionedCalibrator = DevPlattCalibrator
+
+
+__all__ = ["DevPlattCalibrator", "PriorConditionedCalibrator"]

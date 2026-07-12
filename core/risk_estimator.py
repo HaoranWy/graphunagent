@@ -1,272 +1,286 @@
+"""Prior-Weighted Spectral Consensus (PWSC) risk estimator.
 
-"""
-ISE-Flow 量子正则系综自由能 UQ 引擎 (v7.7-ZeroParam-GrandUnified).
-基于吉布斯自由能 f = (1-beta)*NLL + H_VN/\ln N 与玻尔兹曼透射几率 P_wrong = 1 - e^{-f}，
-绝对零超参数、连续可微地达成单路径与多路径、代码域与数学逻辑域的终极对称大一统。
+This module implements the equations in ``PWSC_ALGORITHM_FLOW.md`` and the
+compact contract in ``.pipeline/docs/algorithm_spec_v1.md``,
+without hidden-state features, random projections, gold-label access, or
+post-hoc test-set calibration.
 """
 
-import ast
+from __future__ import annotations
+
 import math
-import logging
 import re
-from typing import List, Dict, Any, Tuple, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
 
-# 🛡️ 严格导入解析器，消除 NameError 崩溃
-from data.parsers import TrajectoryParser
+from core.adapters import TaskAdapter, make_adapter
 
-logger = logging.getLogger("ise_flow.core.risk_estimator")
+
+_SPECIAL_TOKEN_RE = re.compile(r"^<[^>]+>$")
+
+
+def retain_scoring_tokens(items: Sequence[Any]) -> List[Dict[str, Any]]:
+    """Keep finite chosen-token logprobs, excluding control/whitespace tokens."""
+    retained: List[Dict[str, Any]] = []
+    for raw in items or []:
+        if isinstance(raw, dict):
+            token = str(raw.get("token", ""))
+            value = raw.get("logprob")
+            item = dict(raw)
+        else:
+            # Numeric-only inputs are accepted by the backward-compatible API
+            # and receive a synthetic non-whitespace token name.
+            token = "__value__"
+            value = raw
+            item = {"logprob": value}
+        try:
+            logprob = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(logprob):
+            continue
+        if not token or token.isspace() or _SPECIAL_TOKEN_RE.match(token):
+            continue
+        item["token"] = token
+        item["logprob"] = logprob
+        retained.append(item)
+    return retained
+
+
+@dataclass(frozen=True)
+class PathAction:
+    action: float
+    confidence: float
+    valid: bool
+    token_count: int
 
 
 class FisherRaoCovariantPathAction:
-    def __init__(self, logprobs: List[Dict[str, Any]], stalk_dim: int = 10) -> None:
+    """Compatibility wrapper for the retired path-action class.
+
+    The old implementation exposed a random trajectory embedding.  This
+    wrapper exposes only the deterministic PWSC action and a two-value summary
+    for callers that still import the legacy symbol; PWSC itself never uses
+    the summary as a feature map.
+    """
+
+    def __init__(self, logprobs: Sequence[Any], weakest_k: int = 5) -> None:
         self.logprobs = logprobs
-        self.T = len(logprobs)
-        self.d = stalk_dim
+        self.weakest_k = weakest_k
 
     def compute_classical_action(self) -> float:
-        """路径强度经典作用量 (平均 NLL) — 零参数单路径基石。"""
-        if not self.logprobs:
-            return 2.0
-        ll_sum = sum(item["logprob"] for item in self.logprobs)
-        return float(-ll_sum / self.T)
+        return RiskEstimator(weakest_k=self.weakest_k).path_action(self.logprobs).action
 
     def compute_trajectory_embedding(self) -> np.ndarray:
-        rng = np.random.RandomState(42)
-        projection_matrix = rng.normal(0.0, 1.0, (1000, self.d))
-        embeds = []
-        for t in range(min(self.T, 100)):
-            dist_t = self.logprobs[t].get("top_logprobs", {})
-            words = list(dist_t.keys())
-            if not words:
-                continue
-            token_hash = hash(words[0]) % 1000
-            word_vector = projection_matrix[token_hash]
-            prob_weight = math.exp(self.logprobs[t]["logprob"])
-            embeds.append(word_vector * prob_weight)
-        if not embeds:
-            dummy = np.zeros(self.d)
-            dummy[0] = 1.0
-            return dummy
-        h = np.mean(embeds, axis=0)
-        return h / (np.linalg.norm(h) + 1e-12)
+        action = self.compute_classical_action()
+        count = len(retain_scoring_tokens(self.logprobs))
+        return np.asarray([0.0 if not np.isfinite(action) else action, float(count)], dtype=np.float64)
 
 
 class RiskEstimator:
-    """基于量子正则系综自由能的第一性原理大一统 UQ 引擎。"""
+    """Training-free PWSC scorer.
 
-    def __init__(self, verifier_mgr: Optional[Any] = None, generator: Optional[Any] = None) -> None:
+    ``weakest_k`` is selected on development data and defaults to the frozen
+    value specified by the project protocol.
+    """
+
+    def __init__(
+        self,
+        verifier_mgr: Optional[Any] = None,
+        generator: Optional[Any] = None,
+        weakest_k: int = 5,
+    ) -> None:
+        if weakest_k < 1:
+            raise ValueError("weakest_k must be positive")
         self.verifier_mgr = verifier_mgr
         self.generator = generator
+        self.weakest_k = int(weakest_k)
 
-    def _extract_ans(self, text: str, schema_name: str) -> str:
-        if not text:
-            return "null"
-        text_clean = text.strip()
-        if schema_name in ["HumanEvalPlus", "LiveCodeBench"]:
-            if "```python" in text_clean:
-                return text_clean.split("```python")[-1].split("```")[0].strip()
-            return text_clean
-        elif schema_name in ["FOLIO", "P-FOLIO"]:
-            text_lower = text_clean.lower()
-            matches = list(re.finditer(r"\b(true|false|uncertain)\b", text_lower))
-            if matches:
-                return matches[-1].group(1)
-            return text_clean
-        _, final_ans, _ = TrajectoryParser.parse_cot_steps(text_clean)
-        return final_ans.strip() if final_ans else text_clean
+    def path_action(self, logprobs: Sequence[Any]) -> PathAction:
+        tokens = retain_scoring_tokens(logprobs)
+        if not tokens:
+            return PathAction(math.inf, 0.0, False, 0)
+        nll = np.asarray([-float(item["logprob"]) for item in tokens], dtype=np.float64)
+        if np.any(nll < -1e-6):
+            return PathAction(math.inf, 0.0, False, len(nll))
+        # API log probabilities should be <= 0.  Clamping prevents an invalid
+        # provider response from producing q > 1 and violating the score range.
+        nll = np.maximum(nll, 0.0)
+        k = min(self.weakest_k, len(nll))
+        weakest = np.partition(nll, len(nll) - k)[-k:]
+        action = float(np.mean(weakest))
+        confidence = float(np.clip(math.exp(-action), 0.0, 1.0))
+        return PathAction(action, confidence, True, len(nll))
 
+    @staticmethod
+    def _metadata_list(
+        metadata_list: Optional[Sequence[Optional[Dict[str, Any]]]], n: int
+    ) -> List[Optional[Dict[str, Any]]]:
+        values = list(metadata_list or [])
+        if len(values) < n:
+            values.extend([None] * (n - len(values)))
+        return values[:n]
+
+    def score(
+        self,
+        logprobs_list: Sequence[Sequence[Any]],
+        texts: Sequence[str],
+        schema_name: str = "GSM8K",
+        metadata_list: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
+    ) -> Tuple[float, Dict[str, Any]]:
+        """Score one or more sampled paths and return risk plus diagnostics."""
+        n = len(logprobs_list)
+        if n == 0 or len(texts) != n:
+            raise ValueError("logprobs_list and texts must be non-empty and aligned")
+        metadata = self._metadata_list(metadata_list, n)
+        adapter: TaskAdapter = make_adapter(schema_name, metadata)
+        actions = [self.path_action(path) for path in logprobs_list]
+        action_values = np.asarray([item.action for item in actions], dtype=np.float64)
+        confidence = np.asarray([item.confidence for item in actions], dtype=np.float64)
+        logprob_valid = np.asarray([item.valid for item in actions], dtype=bool)
+        domain_valid = adapter.valid_mask(texts)
+        valid = logprob_valid & domain_valid
+        q = confidence * valid.astype(np.float64)
+
+        # A missing logprob stream or an invalid response is a zero-confidence
+        # path, never a fabricated random observation.
+        if not np.any(q > 0.0):
+            diagnostics = self._base_diagnostics(
+                action_values, confidence, valid, q, adapter, texts
+            )
+            diagnostics.update(
+                {
+                    "kernel": np.zeros((n, n), dtype=np.float64),
+                    "rho": np.zeros((n, n), dtype=np.float64),
+                    "eigenvalues": np.zeros(n, dtype=np.float64),
+                    "spectral_entropy": 0.0,
+                    "normalized_spectral_uncertainty": 0.0,
+                    "mean_path_confidence": 0.0,
+                    "selected_index": 0,
+                    "selected_outcome": adapter.outcome_keys(texts)[0],
+                    "risk": 1.0,
+                }
+            )
+            return 1.0, diagnostics
+
+        # Stable log-sum-exp normalization of q_i = exp(-s_i) for valid paths.
+        log_q = np.full(n, -np.inf, dtype=np.float64)
+        for idx, item in enumerate(actions):
+            if valid[idx]:
+                log_q[idx] = -item.action
+        shift = float(np.max(log_q[np.isfinite(log_q)]))
+        weights = np.zeros(n, dtype=np.float64)
+        weights[valid] = np.exp(log_q[valid] - shift)
+        weights /= float(np.sum(weights))
+
+        features = adapter.feature_matrix(texts, valid)
+        kernel = np.asarray(features @ features.T, dtype=np.float64)
+        # Numerical cleanup is explicit; the feature map itself guarantees PSD.
+        kernel = (kernel + kernel.T) / 2.0
+        if np.any(valid):
+            if not np.allclose(np.diag(kernel)[valid], 1.0, atol=1e-8):
+                raise ValueError("valid feature vectors must have unit norm")
+            valid_kernel = kernel[np.ix_(valid, valid)]
+            min_kernel_eig = float(np.min(np.linalg.eigvalsh(valid_kernel)))
+            if min_kernel_eig < -1e-8:
+                raise ValueError(f"feature kernel is not PSD (min eigenvalue {min_kernel_eig})")
+
+        sqrt_w = np.sqrt(weights)
+        rho = np.outer(sqrt_w, sqrt_w) * kernel
+        rho = (rho + rho.T) / 2.0
+        eigenvalues = np.linalg.eigvalsh(rho)
+        if float(np.min(eigenvalues)) < -1e-8:
+            raise ValueError("density matrix is not PSD")
+        eigenvalues = np.clip(eigenvalues, 0.0, None)
+        # Treat machine-level null eigenvalues as exact zeros.  Otherwise a
+        # rank-one ensemble can acquire a spurious 1e-15 entropy signal that
+        # later statistical tests may mistake for evidence.
+        eigenvalues[eigenvalues < 1e-12] = 0.0
+        trace = float(np.sum(eigenvalues))
+        if trace <= 0.0:
+            raise ValueError("density matrix has zero trace")
+        eigenvalues /= trace
+        valid_count = int(np.sum(valid))
+        spectral_entropy = float(
+            -np.sum(eigenvalues[eigenvalues > 0] * np.log(eigenvalues[eigenvalues > 0]))
+        )
+        uncertainty = 0.0 if valid_count <= 1 else spectral_entropy / math.log(valid_count)
+        uncertainty = float(max(0.0, min(1.0, uncertainty)))
+        mean_confidence = float(np.mean(q))
+        risk = float(np.clip(1.0 - (1.0 - uncertainty) * mean_confidence, 0.0, 1.0))
+
+        centrality = kernel @ weights
+        candidate_scores = q * centrality
+        selected_index = int(np.argmax(candidate_scores))
+        outcomes = adapter.outcome_keys(texts)
+        diagnostics = self._base_diagnostics(action_values, confidence, valid, q, adapter, texts)
+        diagnostics.update(
+            {
+                "kernel": kernel,
+                "rho": rho,
+                "eigenvalues": eigenvalues,
+                "spectral_entropy": spectral_entropy,
+                "normalized_spectral_uncertainty": uncertainty,
+                "mean_path_confidence": mean_confidence,
+                "weights": weights,
+                "centrality": centrality,
+                "candidate_scores": candidate_scores,
+                "selected_index": selected_index,
+                "selected_outcome": outcomes[selected_index],
+                "risk": risk,
+            }
+        )
+        return risk, diagnostics
+
+    def _base_diagnostics(
+        self,
+        actions: np.ndarray,
+        confidence: np.ndarray,
+        valid: np.ndarray,
+        q: np.ndarray,
+        adapter: TaskAdapter,
+        texts: Sequence[str],
+    ) -> Dict[str, Any]:
+        return {
+            "method": "PWSC-v1.0",
+            "weakest_k": self.weakest_k,
+            "path_actions": actions,
+            "path_confidences": confidence,
+            "valid_mask": valid,
+            "q": q,
+            "valid_count": int(np.sum(valid)),
+            "domain_family": adapter.family,
+            "outcomes": adapter.outcome_keys(texts),
+        }
+
+    # Backward-compatible single-path API used by older callers.
     def estimate_structural_risk(
-        self, 
-        G_sequence: Any = None, 
+        self,
+        G_sequence: Any = None,
         schema_name: str = "GSM8K",
         trajectory_text: str = "",
         gold_answer: str = "",
         entry_point: str = "",
-        logprobs: Optional[List[Dict[str, Any]]] = None,
-        attentions: Optional[np.ndarray] = None
+        logprobs: Optional[Sequence[Any]] = None,
+        attentions: Optional[np.ndarray] = None,
     ) -> Tuple[float, float, List[float], Dict[str, Any]]:
-        """
-        【单路径模式接口 - N=1】单路径下无共识， Wrong 几率等价于自由能透射几率：
-        $$ P_wrong = 1.0 - e^{-(1-\beta)*S_class} $$
-        """
-        if not logprobs:
-            return 0.5, 0.0, [0.5], {}
+        metadata = [{"entry_point": entry_point}]
+        risk, diagnostics = self.score([list(logprobs or [])], [trajectory_text], schema_name, metadata)
+        curve_length = max(1, len(retain_scoring_tokens(logprobs or [])))
+        return risk, 0.0, [risk] * curve_length, diagnostics
 
-        T = len(logprobs)
-        path_action = FisherRaoCovariantPathAction(logprobs)
-        S_class = path_action.compute_classical_action()
-        
-        # 1. 提取单路径自监督 AST 特征
-        target_types = (
-            ast.Assign, ast.AugAssign, ast.For, ast.While, ast.If,
-            ast.FunctionDef, ast.Return, ast.Call, ast.BinOp,
-            ast.Compare, ast.List, ast.Dict, ast.Set, ast.Name, ast.Constant
-        )
-        v_ast = np.zeros(len(target_types), dtype=np.float64)
-        code_clean = trajectory_text.split("```python")[-1].split("```")[0].strip() if "```python" in trajectory_text else trajectory_text
-        try:
-            tree = ast.parse(code_clean)
-            node_map = {t: idx for idx, t in enumerate(target_types)}
-            for node in ast.walk(tree):
-                node_type = type(node)
-                if node_type in node_map:
-                    v_ast[node_map[node_type]] += 1.0
-        except Exception:
-            pass
-            
-        beta = 1.0 if np.any(v_ast > 0.0) else 0.0
-        
-        # 2. 玻尔兹曼透射几率映射 (自监督消偏)
-        p_wrong = float(1.0 - np.exp(-(1.0 - beta) * S_class))
-
-        extra_diagnostics = {
-            "raw_r_struct_unbiased": p_wrong,
-            "avg_edge_weight": S_class,
-            "fiedler_connectivity": 0.0,
-            "attention_entropy": 0.0,
-            "hodge_exact_ratio": 1.0 - p_wrong,
-            "hodge_coexact_ratio": p_wrong,
-            "hodge_harmonic_ratio": 0.0,
-            "cech_obstruction": 0.0,
-            "action_variance": S_class,
-            "ead_in": 0.0,
-            "consensus_ratio": 1.0
-        }
-        return p_wrong, 0.0, [p_wrong] * T, extra_diagnostics
-
+    # Backward-compatible ensemble API used by older callers.
     def estimate_ensemble_risk(
         self,
         logprobs_list: List[List[Dict[str, Any]]],
         answers_list: List[str],
         schema_name: str = "GSM8K",
-        **kwargs  
+        metadata_list: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
+        **kwargs: Any,
     ) -> Tuple[float, Dict[str, Any]]:
-        """
-        【多路径系综接口 - N>1】解算连续双同伦密度算子的冯诺伊曼熵，并对经典能级迹进行正则系综对合。
-        """
-        if not logprobs_list:
-            return 0.5, {}
+        return self.score(logprobs_list, answers_list, schema_name, metadata_list)
 
-        N = len(logprobs_list)
-        class_actions = []
-        embeddings = []
-        
-        for path_logprobs in logprobs_list:
-            path_action = FisherRaoCovariantPathAction(path_logprobs)
-            class_actions.append(path_action.compute_classical_action())
-            embeddings.append(path_action.compute_trajectory_embedding())
-            
-        class_actions = np.array(class_actions)
-        embeddings = np.array(embeddings)
 
-        # 1. 求解自回归文本空间原始 Gram 相似度矩阵 $S_{raw}$
-        norms = np.linalg.norm(embeddings, axis=-1, keepdims=True) + 1e-12
-        embeddings_normalized = embeddings / norms
-        S_raw = np.dot(embeddings_normalized, embeddings_normalized.T)
-
-        # 2. 无参中位数平移核 (Conformal Median Bandwidth)
-        D = 1.0 - S_raw
-        off_diag_mask = ~np.eye(N, dtype=bool)
-        if np.any(off_diag_mask) and N > 1:
-            median_dist = np.median(D[off_diag_mask])
-            gamma = 2.0 / (median_dist + 1e-8)
-        else:
-            gamma = 8.0
-            
-        S_text = np.exp(gamma * (S_raw - 1.0))
-
-        # 3. 求解语法特征向量
-        ast_vectors = []
-        ast_valid_count = 0
-        for text in answers_list:
-            target_types = (
-                ast.Assign, ast.AugAssign, ast.For, ast.While, ast.If,
-                ast.FunctionDef, ast.Return, ast.Call, ast.BinOp,
-                ast.Compare, ast.List, ast.Dict, ast.Set, ast.Name, ast.Constant
-            )
-            v_ast = np.zeros(len(target_types), dtype=np.float64)
-            code_clean = text.split("```python")[-1].split("```")[0].strip() if "```python" in text else text
-            try:
-                tree = ast.parse(code_clean)
-                node_map = {t: idx for idx, t in enumerate(target_types)}
-                for node in ast.walk(tree):
-                    node_type = type(node)
-                    if node_type in node_map:
-                        v_ast[node_map[node_type]] += 1.0
-            except Exception:
-                pass
-            ast_vectors.append(v_ast)
-            if np.any(v_ast > 0.0):
-                ast_valid_count += 1
-                
-        beta = float(ast_valid_count) / float(N) if N > 0 else 0.0
-        
-        S_ast = np.zeros((N, N), dtype=np.float64)
-        for i in range(N):
-            S_ast[i, i] = 1.0
-            for j in range(i + 1, N):
-                v_i, v_j = ast_vectors[i], ast_vectors[j]
-                norm_i, norm_j = np.linalg.norm(v_i), np.linalg.norm(v_j)
-                sim = np.dot(v_i, v_j) / (norm_i * norm_j + 1e-12) if (norm_i > 1e-12 and norm_j > 1e-12) else 0.0
-                S_ast[i, j] = sim
-                S_ast[j, i] = sim
-
-        # 4. 求解硬同伦等价投影矩阵 M_hard
-        cleaned_answers = [self._extract_ans(ans, schema_name) for ans in answers_list]
-        M_hard = np.zeros((N, N), dtype=np.float64)
-        for i in range(N):
-            for j in range(N):
-                if cleaned_answers[i] == cleaned_answers[j]:
-                    M_hard[i, j] = 1.0
-
-        # 5. 【大一统核设计】K = (1-beta) * M_hard + beta * S_ast
-        K = (1.0 - beta) * M_hard + beta * S_ast
-
-        # 6. 🛡️ 【第一性原理突破：混态迹等变对合】
-        # 计算玻尔兹曼信心权重 w_i = e^{-(1-beta)*S_class_i} / \sum e^{-(1-beta)*S_class_j}
-        p_prior = np.exp(-(1.0 - beta) * class_actions)
-        w = p_prior / (np.sum(p_prior) + 1e-12)
-        sqrt_w = np.sqrt(w)
-        
-        # 构建密度矩阵 \rho = \sqrt{w_i} K_{ij} \sqrt{w_j}
-        rho = np.outer(sqrt_w, sqrt_w) * K
-        
-        # 求解本征谱
-        try:
-            evals = np.linalg.eigvalsh(rho)
-            evals = np.clip(evals, 0.0, None)
-            rho_evals = evals / (np.sum(evals) + 1e-12)
-        except Exception:
-            rho_evals = np.ones(N) / N
-
-        # 7. 计算本征冯·诺伊曼谱熵 H_VN = -\sum \lambda_k \ln \lambda_k
-        h_vn = -np.sum(rho_evals * np.log(rho_evals + 1e-12))
-        u_semantic = float(h_vn / np.log(N)) if N > 1 else 0.0
-        u_semantic = float(np.clip(u_semantic, 0.0, 1.0))
-
-        # 8. 【吉布斯大一统自由能公式 (Gibbs Free Energy UQ)】
-        # f = (1-beta) * \bar{S_class} + U_semantic
-        # P_wrong = 1.0 - exp(-f)
-        nll_mean = float(np.mean(class_actions))
-        free_energy_density = (1.0 - beta) * nll_mean + u_semantic
-        
-        r_ensemble_pi = float(1.0 - np.exp(-free_energy_density))
-        r_ensemble_pi = float(np.clip(r_ensemble_pi, 0.0, 1.0))
-
-        # 精准解耦落盘数据
-        extra_diagnostics = {
-            "raw_r_struct_unbiased": r_ensemble_pi,
-            "avg_edge_weight": nll_mean,                    # 1a 映射: 真实平均经典 NLL
-            "fiedler_connectivity": h_vn,                   # 2a 映射: 真实本征冯·诺伊曼谱熵 H_VN
-            "attention_entropy": u_semantic,                 # 3a 映射: 归一化不确定度
-            "hodge_exact_ratio": 1.0 - r_ensemble_pi,
-            "hodge_coexact_ratio": r_ensemble_pi,
-            "hodge_harmonic_ratio": 0.0,
-            "cech_obstruction": float(np.std(class_actions)),
-            "action_variance": float(np.std(class_actions)),
-            "ead_in": 0.0,
-            "consensus_ratio": 1.0 - r_ensemble_pi
-        }
-
-        return r_ensemble_pi, extra_diagnostics
+__all__ = ["FisherRaoCovariantPathAction", "PathAction", "RiskEstimator", "retain_scoring_tokens"]

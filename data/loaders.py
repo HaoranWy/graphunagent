@@ -1,220 +1,330 @@
-# -*- coding: utf-8 -*-
-"""DatasetLoader 模块.
+"""Deterministic local dataset loaders for the PWSC experiments."""
 
-支持 GSM8K, HumanEvalPlus, AIME2025, AIME2026, FOLIO, P-FOLIO, LiveCodeBench, MATH-500
-八大前沿数据集的本地 Parquet/JSONL/CSV 文件无缝加载。
-完全消除了键名错配引发的 KeyError，并对 NaN 空值进行了安全归一化。
-"""
+from __future__ import annotations
 
-import os
+import base64
+import hashlib
 import json
 import logging
-from typing import List, Dict, Any, Tuple, Optional
+import os
+import pickle
+import zlib
 from dataclasses import dataclass, field
-
-logger = logging.getLogger("ise_flow.data.loaders")
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     import pandas as pd
-    PANDAS_AVAILABLE = True
-except ImportError:
-    PANDAS_AVAILABLE = False
+except ImportError:  # pragma: no cover - only relevant in a minimal install
+    pd = None
+
+logger = logging.getLogger("ise_flow.data.loaders")
 
 
 @dataclass(frozen=True)
 class TaskSample:
     sample_id: str
     task_type: str
-    prompt_data: Dict[str, str]
+    prompt_data: Dict[str, Any]
     raw_question: str
     gold_answer: str
     difficulty: int = 3
     metadata: Dict[str, Any] = field(default_factory=dict, hash=False)
 
 
-class DatasetLoader:
+def _first(mapping: Dict[str, Any], *names: str, default: Any = "") -> Any:
+    for name in names:
+        value = mapping.get(name)
+        if value is not None and str(value).lower() not in {"nan", "none"}:
+            return value
+    return default
 
+
+class DatasetLoader:
     def __init__(self, base_dir: str = "/data/newmodel/graphunagent/datasets") -> None:
-        self.base_dir = base_dir
+        self.base_dir = Path(base_dir)
+
+    def _require(self, path: Path) -> Path:
+        if not path.exists():
+            raise FileNotFoundError(f"Dataset file not found: {path}")
+        return path
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def dataset_fingerprint(self, task_name: str) -> Dict[str, Any]:
+        """Return immutable source metadata for a run manifest."""
+        paths: List[Path]
+        if task_name == "GSM8K":
+            paths = [self.base_dir / "gsm8k" / "main" / "test-00000-of-00001.parquet"]
+        elif task_name == "HumanEvalPlus":
+            paths = [self.base_dir / "humanevalplus" / "data" / "test-00000-of-00001-5973903632b82d40.parquet"]
+        elif task_name == "MATH-500":
+            paths = [self.base_dir / "MATH-500" / "test.jsonl"]
+        elif task_name == "FOLIO":
+            paths = [self.base_dir / "folio" / "validation.jsonl"]
+        elif task_name == "P-FOLIO":
+            paths = [self.base_dir / "P-FOLIO" / "FOLIO.csv", self.base_dir / "P-FOLIO" / "P-FOLIO.csv"]
+        elif task_name == "AIME2025":
+            paths = [self.base_dir / "AIME2025" / "aime2025-I.jsonl", self.base_dir / "AIME2025" / "aime2025-II.jsonl"]
+        elif task_name == "AIME2026":
+            paths = [self.base_dir / "AIME2026" / "aime2026.jsonl"]
+        elif task_name == "LiveCodeBench":
+            paths = [self.base_dir / "livecodebench" / ".hfd" / "repo_metadata.json"]
+        else:
+            raise NotImplementedError(f"No dataset fingerprint mapping for {task_name}")
+        files = []
+        for path in paths:
+            self._require(path)
+            files.append({"path": str(path.resolve()), "bytes": path.stat().st_size, "sha256": self._sha256(path)})
+        revision = None
+        dataset_id = task_name
+        metadata_roots = {
+            "GSM8K": self.base_dir / "gsm8k",
+            "MATH-500": self.base_dir / "MATH-500",
+            "HumanEvalPlus": self.base_dir / "humanevalplus",
+            "FOLIO": self.base_dir / "folio",
+            "P-FOLIO": self.base_dir / "P-FOLIO",
+            "AIME2025": self.base_dir / "AIME2025",
+            "AIME2026": self.base_dir / "AIME2026",
+            "LiveCodeBench": self.base_dir / "livecodebench",
+        }
+        metadata_path = metadata_roots[task_name] / ".hfd" / "repo_metadata.json"
+        if metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                revision = metadata.get("sha")
+                dataset_id = metadata.get("id", dataset_id)
+            except (OSError, ValueError):
+                pass
+        return {"dataset_id": dataset_id, "revision": revision, "files": files}
+
+    @staticmethod
+    def _limit(items: List[TaskSample], limit: Optional[int]) -> List[TaskSample]:
+        return items if limit is None or limit <= 0 else items[:limit]
 
     def load_gsm8k_split(self) -> Tuple[List[TaskSample], List[TaskSample]]:
-        local_dir = os.path.join(self.base_dir, "gsm8k/main")
-        test_path = os.path.join(local_dir, "test-00000-of-00001.parquet")
-        train_path = os.path.join(local_dir, "train-00000-of-00001.parquet")
+        if pd is None:
+            raise ImportError("pandas is required for GSM8K parquet files")
+        local_dir = self.base_dir / "gsm8k" / "main"
+        test_path = self._require(local_dir / "test-00000-of-00001.parquet")
+        train_path = local_dir / "train-00000-of-00001.parquet"
+        test_df = pd.read_parquet(test_path)
 
-        df_test = pd.read_parquet(test_path)
-        test_samples = []
-        for i, row in df_test.iterrows():
-            gold_val = row["answer"].split("####")[-1].strip()
-            test_samples.append(TaskSample(
-                sample_id=f"gsm8k_test_{i}",
-                task_type="GSM8K",
-                prompt_data={"question": row["question"]},
-                raw_question=row["question"],
-                gold_answer=gold_val
-            ))
-        return [], test_samples
+        def convert(frame: Any, prefix: str) -> List[TaskSample]:
+            rows: List[TaskSample] = []
+            for idx, row in frame.iterrows():
+                answer = str(row.get("answer", ""))
+                gold = answer.split("####")[-1].strip() if "####" in answer else answer
+                question = str(row.get("question", ""))
+                rows.append(TaskSample(f"{prefix}_{idx}", "GSM8K", {"question": question}, question, gold))
+            return rows
 
-    def load_humanevalplus_test(self) -> List[TaskSample]:
-        """物理读取本地官方 HumanEval+ 测试分片 (Parquet 格式)."""
-        local_parquet_path = os.path.join(self.base_dir, "humanevalplus/data/test-00000-of-00001-5973903632b82d40.parquet")
-        
-        if not os.path.exists(local_parquet_path):
-            local_parquet_path = "/data/newmodel/graphunagent/datasets/humanevalplus/data/test-00000-of-00001-5973903632b82d40.parquet"
-            if not os.path.exists(local_parquet_path):
-                raise FileNotFoundError(f"HumanEvalPlus Parquet file not found at: {local_parquet_path}")
+        return (convert(pd.read_parquet(train_path), "gsm8k_train") if train_path.exists() else [], convert(test_df, "gsm8k_test"))
 
-        logger.info(f"Loading official HumanEval+ TEST set from Parquet: {local_parquet_path}")
-        df = pd.read_parquet(local_parquet_path)
-        
-        test_samples = []
-        for i, row in df.iterrows():
-            task_id = row.get("task_id", f"HE_{i}")
-            prompt = row.get("prompt", "")
-            test_code = row.get("test", "")
-            entry_point = row.get("entry_point", "")
-            
-            test_samples.append(TaskSample(
-                sample_id=str(task_id).replace("/", "_"),
-                task_type="Code",
-                prompt_data={
-                    "prompt": prompt,
-                    "test_code": test_code,
-                    "entry_point": entry_point
-                },
-                raw_question=prompt,
-                gold_answer=test_code,
-                metadata={"entry_point": entry_point, "task_id": task_id}
-            ))
-            
-        return test_samples
-
-    def load_aime2025_split(self) -> List[TaskSample]:
-        aime_dir = os.path.join(self.base_dir, "AIME2025")
-        test_samples = []
-        for split in ["aime2025-I.jsonl", "aime2025-II.jsonl"]:
-            path = os.path.join(aime_dir, split)
-            if not os.path.exists(path):
-                continue
-            with open(path, "r", encoding="utf-8") as f:
-                for idx, line in enumerate(f):
-                    data = json.loads(line)
-                    # 宽口径提取键值
-                    raw_q = data.get("question") or data.get("problem") or ""
-                    gold = data.get("answer") or data.get("solution") or ""
-                    test_samples.append(TaskSample(
-                        sample_id=f"aime2025_{split.split('.')[0]}_{idx}",
-                        task_type="AIME",
-                        prompt_data={"question": str(raw_q)},
-                        raw_question=str(raw_q),
-                        gold_answer=str(gold).strip()
-                    ))
-        return test_samples
-
-    def load_aime2026_split(self) -> List[TaskSample]:
-        path = os.path.join(self.base_dir, "AIME2026/aime2026.jsonl")
-        test_samples = []
-        with open(path, "r", encoding="utf-8") as f:
-            for idx, line in enumerate(f):
-                data = json.loads(line)
-                # 核心修复二：使用 get() 宽口径，防止 AIME2026 的 'problem' 键名引发 KeyError
-                raw_q = data.get("question") or data.get("problem") or ""
-                gold = data.get("answer") or data.get("solution") or ""
-                test_samples.append(TaskSample(
-                    sample_id=f"aime2026_{idx}",
-                    task_type="AIME",
-                    prompt_data={"question": str(raw_q)},
-                    raw_question=str(raw_q),
-                    gold_answer=str(gold).strip()
-                ))
-        return test_samples
-
-    def load_folio_split(self) -> List[TaskSample]:
-        path = os.path.join(self.base_dir, "folio/validation.jsonl")
-        test_samples = []
-        with open(path, "r", encoding="utf-8") as f:
-            for idx, line in enumerate(f):
-                data = json.loads(line)
-                premises_list = data.get("premises", [])
-                premises_str = "\n".join(premises_list) if isinstance(premises_list, list) else str(premises_list)
-                conclusion = data.get("conclusion", "")
-                label = data.get("label", "")
-                
-                prompt = f"Premises:\n{premises_str}\n\nConclusion: {conclusion}\nIs the conclusion True, False, or Uncertain?"
-                test_samples.append(TaskSample(
-                    sample_id=f"folio_{idx}",
-                    task_type="FOLIO",
-                    prompt_data={"question": prompt},
+    def load_humanevalplus_test(self, limit: Optional[int] = None) -> List[TaskSample]:
+        if pd is None:
+            raise ImportError("pandas is required for HumanEvalPlus parquet files")
+        path = self._require(self.base_dir / "humanevalplus" / "data" / "test-00000-of-00001-5973903632b82d40.parquet")
+        frame = pd.read_parquet(path)
+        samples: List[TaskSample] = []
+        for idx, row in frame.iterrows():
+            task_id = str(row.get("task_id", f"HumanEval/{idx}"))
+            prompt = str(row.get("prompt", ""))
+            entry = str(row.get("entry_point", ""))
+            test_code = str(row.get("test", ""))
+            samples.append(
+                TaskSample(
+                    sample_id=task_id.replace("/", "_"),
+                    task_type="HumanEvalPlus",
+                    prompt_data={"prompt": prompt, "test_code": test_code, "entry_point": entry},
                     raw_question=prompt,
-                    gold_answer=str(label).strip()
-                ))
-        return test_samples
+                    gold_answer=test_code,
+                    metadata={"entry_point": entry, "task_id": task_id},
+                )
+            )
+        return self._limit(samples, limit)
 
-    def load_p_folio_split(self) -> List[TaskSample]:
-        path = os.path.join(self.base_dir, "P-FOLIO/P-FOLIO.csv")
-        df = pd.read_csv(path)
-        test_samples = []
-        for idx, row in df.iterrows():
-            premises = str(row.get("premises", row.get("story", ""))).strip()
-            conclusion = str(row.get("conclusion", "")).strip()
-            label = str(row.get("label", row.get("target", ""))).strip()
-            
-            # 安全归一化 NaN
-            if pd.isna(row.get("label")) and pd.isna(row.get("target")):
-                label = "uncertain"
-                
-            prompt = f"Premises:\n{premises}\n\nConclusion: {conclusion}\nIs the conclusion True, False, or Uncertain?"
-            test_samples.append(TaskSample(
-                sample_id=f"pfolio_{idx}",
-                task_type="FOLIO",
-                prompt_data={"question": prompt},
-                raw_question=prompt,
-                gold_answer=label
-            ))
-        return test_samples
-
-    def load_livecodebench_split(self) -> List[TaskSample]:
-        test_samples = []
-        lcb_dir = os.path.join(self.base_dir, "livecodebench")
-        for i in range(1, 7):
-            path = os.path.join(lcb_dir, f"test{i}.jsonl")
-            if not os.path.exists(path):
-                path = os.path.join(lcb_dir, "test.jsonl")
-                if not os.path.exists(path):
-                    continue
-            with open(path, "r", encoding="utf-8") as f:
-                for idx, line in enumerate(f):
+    def load_aime2025_split(self, limit: Optional[int] = None) -> List[TaskSample]:
+        samples: List[TaskSample] = []
+        root = self.base_dir / "AIME2025"
+        for filename in ("aime2025-I.jsonl", "aime2025-II.jsonl"):
+            path = root / filename
+            if not path.exists():
+                continue
+            with path.open(encoding="utf-8") as handle:
+                for idx, line in enumerate(handle):
                     data = json.loads(line)
-                    # 核心修复三：对 LCB 的 test_cases 键名采用多层 fallback 获取，防止返回空列表
-                    test_cases = data.get("test_cases") or data.get("test_case") or data.get("tests") or data.get("test") or []
-                    
-                    test_samples.append(TaskSample(
-                        sample_id=f"lcb_{i}_{idx}",
-                        task_type="LiveCodeBench",
-                        prompt_data={
-                            "question": data.get("question", ""),
-                            "test_cases": json.dumps(test_cases)
-                        },
-                        raw_question=data.get("question", ""),
-                        gold_answer=json.dumps(test_cases)
-                    ))
-            if path.endswith("test.jsonl"):
-                break
-        return test_samples
+                    question = str(_first(data, "question", "problem", default=""))
+                    answer = str(_first(data, "answer", "solution", default="")).strip()
+                    samples.append(TaskSample(f"aime2025_{filename}_{idx}", "AIME2025", {"question": question}, question, answer))
+                    if limit and len(samples) >= limit:
+                        return samples
+        return samples
 
-    def load_math500_split(self) -> List[TaskSample]:
-        path = os.path.join(self.base_dir, "MATH-500/test.jsonl")
-        test_samples = []
-        with open(path, "r", encoding="utf-8") as f:
-            for idx, line in enumerate(f):
+    def load_aime2026_split(self, limit: Optional[int] = None) -> List[TaskSample]:
+        path = self._require(self.base_dir / "AIME2026" / "aime2026.jsonl")
+        samples: List[TaskSample] = []
+        with path.open(encoding="utf-8") as handle:
+            for idx, line in enumerate(handle):
                 data = json.loads(line)
-                raw_q = data.get("problem") or data.get("question") or ""
-                gold = data.get("solution") or data.get("answer") or ""
-                test_samples.append(TaskSample(
-                    sample_id=f"math500_{idx}",
-                    task_type="MATH",
-                    prompt_data={"question": str(raw_q)},
-                    raw_question=str(raw_q),
-                    gold_answer=str(gold).strip()
-                ))
-        return test_samples
+                question = str(_first(data, "question", "problem", default=""))
+                answer = str(_first(data, "answer", "solution", default="")).strip()
+                samples.append(TaskSample(f"aime2026_{idx}", "AIME2026", {"question": question}, question, answer))
+                if limit and len(samples) >= limit:
+                    break
+        return samples
+
+    @staticmethod
+    def _folio_prompt(premises: Any, conclusion: Any) -> str:
+        if isinstance(premises, list):
+            premise_text = "\n".join(str(item) for item in premises)
+        else:
+            premise_text = str(premises or "")
+        return f"Premises:\n{premise_text}\n\nConclusion: {conclusion}\nIs the conclusion True, False, or Uncertain?"
+
+    def load_folio_split(self, limit: Optional[int] = None) -> List[TaskSample]:
+        path = self._require(self.base_dir / "folio" / "validation.jsonl")
+        samples: List[TaskSample] = []
+        with path.open(encoding="utf-8") as handle:
+            for idx, line in enumerate(handle):
+                data = json.loads(line)
+                premises = _first(data, "premises", "story", default=[])
+                conclusion = str(_first(data, "conclusion", default=""))
+                label = str(_first(data, "label", "truth", "truth_value", default=""))
+                prompt = self._folio_prompt(premises, conclusion)
+                samples.append(TaskSample(f"folio_{idx}", "FOLIO", {"question": prompt}, prompt, label))
+                if limit and len(samples) >= limit:
+                    break
+        return samples
+
+    def load_p_folio_split(self, limit: Optional[int] = None) -> List[TaskSample]:
+        """Load P-FOLIO questions from its paired FOLIO table.
+
+        ``P-FOLIO.csv`` is a derivation-chain table and intentionally has no
+        question-level premise/conclusion/label columns.  The release ships a
+        paired ``FOLIO.csv`` containing the question-level labels; using that
+        table avoids silently converting missing labels to ``uncertain``.
+        """
+        if pd is None:
+            raise ImportError("pandas is required for P-FOLIO CSV files")
+        root = self.base_dir / "P-FOLIO"
+        question_path = self._require(root / "FOLIO.csv")
+        frame = pd.read_csv(question_path)
+        required = {"Premises - NL", "Conclusions - NL", "Truth Values"}
+        missing = required.difference(frame.columns)
+        if missing:
+            raise ValueError(f"P-FOLIO question table missing columns: {sorted(missing)}")
+
+        samples: List[TaskSample] = []
+        for row_idx, row in frame.iterrows():
+            premises = str(row["Premises - NL"] if pd.notna(row["Premises - NL"]) else "")
+            conclusions = str(row["Conclusions - NL"] if pd.notna(row["Conclusions - NL"]) else "").splitlines()
+            labels = str(row["Truth Values"] if pd.notna(row["Truth Values"]) else "").splitlines()
+            if not conclusions or len(conclusions) != len(labels):
+                logger.warning("Skipping P-FOLIO row %s with unaligned conclusions/labels", row_idx)
+                continue
+            for conclusion_idx, (conclusion, label) in enumerate(zip(conclusions, labels)):
+                label = label.strip().upper()
+                if not conclusion.strip() or label not in {"T", "F", "U"}:
+                    logger.warning("Skipping P-FOLIO row %s conclusion %s with invalid label", row_idx, conclusion_idx)
+                    continue
+                prompt = self._folio_prompt(premises, conclusion)
+                samples.append(
+                    TaskSample(
+                        f"pfolio_{row_idx}_{conclusion_idx}",
+                        "P-FOLIO",
+                        {"question": prompt},
+                        prompt,
+                        label,
+                        metadata={"source_row": int(row_idx), "conclusion_index": conclusion_idx, "derivation_table": str(root / "P-FOLIO.csv")},
+                    )
+                )
+                if limit and len(samples) >= limit:
+                    return samples
+        if not samples:
+            raise ValueError("P-FOLIO loader produced no labeled samples")
+        return samples
+
+    @staticmethod
+    def _decode_lcb_private(value: Any) -> List[Dict[str, Any]]:
+        if isinstance(value, list):
+            return value
+        if not value:
+            return []
+        try:
+            return json.loads(str(value))
+        except Exception:
+            try:
+                raw = base64.b64decode(str(value).encode("utf-8"))
+                return json.loads(pickle.loads(zlib.decompress(raw)))
+            except Exception as exc:
+                raise ValueError("Unable to decode LiveCodeBench private_test_cases") from exc
+
+    def load_livecodebench_split(self, limit: Optional[int] = None, release_files: Optional[Iterable[str]] = None) -> List[TaskSample]:
+        root = self._require(self.base_dir / "livecodebench")
+        names = list(release_files or ("test.jsonl", "test2.jsonl", "test3.jsonl", "test4.jsonl", "test5.jsonl", "test6.jsonl"))
+        samples: List[TaskSample] = []
+        for filename in names:
+            path = root / filename
+            if not path.exists():
+                continue
+            with path.open(encoding="utf-8") as handle:
+                for idx, line in enumerate(handle):
+                    data = json.loads(line)
+                    public = json.loads(data.get("public_test_cases") or "[]")
+                    private = self._decode_lcb_private(data.get("private_test_cases"))
+                    tests = public + private
+                    metadata = json.loads(data.get("metadata") or "{}")
+                    fn_name = metadata.get("func_name")
+                    input_output = {
+                        "inputs": [str(item.get("input", "")) for item in tests],
+                        "outputs": [str(item.get("output", "")) for item in tests],
+                        "fn_name": fn_name,
+                    }
+                    title = str(data.get("question_title", ""))
+                    question = str(data.get("question_content", ""))
+                    starter = str(data.get("starter_code", ""))
+                    prompt = "\n\n".join(part for part in (title, question, starter) if part)
+                    sample_id = f"lcb_{data.get('question_id', filename)}"
+                    samples.append(
+                        TaskSample(
+                            sample_id,
+                            "LiveCodeBench",
+                            {"question": prompt, "starter_code": starter},
+                            prompt,
+                            json.dumps(tests, ensure_ascii=False),
+                            metadata={
+                                "question_id": data.get("question_id"),
+                                "platform": data.get("platform"),
+                                "func_name": fn_name,
+                                "input_output": input_output,
+                                "dataset_file": filename,
+                            },
+                        )
+                    )
+                    if limit and len(samples) >= limit:
+                        return samples
+        if not samples:
+            raise FileNotFoundError(f"No LiveCodeBench JSONL files found under {root}")
+        return samples
+
+    def load_math500_split(self, limit: Optional[int] = None) -> List[TaskSample]:
+        path = self._require(self.base_dir / "MATH-500" / "test.jsonl")
+        samples: List[TaskSample] = []
+        with path.open(encoding="utf-8") as handle:
+            for idx, line in enumerate(handle):
+                data = json.loads(line)
+                question = str(_first(data, "problem", "question", default=""))
+                answer = _first(data, "answer", default=None)
+                if answer is None or str(answer).strip() == "":
+                    answer = data.get("solution", "")
+                samples.append(TaskSample(f"math500_{idx}", "MATH-500", {"question": question}, question, str(answer).strip()))
+                if limit and len(samples) >= limit:
+                    break
+        return samples
