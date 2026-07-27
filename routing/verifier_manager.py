@@ -1,7 +1,7 @@
 """Fail-closed verifiers for the supported benchmark domains.
 
 Execution-based verifiers run in a child process with a hard timeout.  They
-are evaluation tools only; none of them is consulted by PWSC while scoring a
+are evaluation tools only; none of them is consulted by PWSC-CI while scoring a
 response.
 """
 
@@ -19,7 +19,13 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
-from core.adapters import canonical_logic_label, canonical_math_answer, extract_last_boxed, extract_python_code
+from core.adapters import (
+    bounded_math_verify,
+    canonical_logic_label,
+    canonical_math_answer,
+    extract_last_boxed,
+    extract_python_code,
+)
 
 logger = logging.getLogger("ise_flow.routing.verifier")
 
@@ -120,6 +126,34 @@ class HumanEvalPlusVerifier(BaseVerifier):
         return _run_child(_exec_program_worker, (program,), timeout=8.0)
 
 
+class MBPPPlusVerifier(BaseVerifier):
+    """Execute the released MBPP+ tests after scoring has finished."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            VerifierSpec(
+                "mbpp_plus_tester",
+                base_cost_vector=(0.02, 2.0, 8.0, 0.0, 0.0, 0.0),
+            )
+        )
+
+    def execute(
+        self,
+        code_or_text: str,
+        gold_answer: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        code = extract_python_code(code_or_text)
+        tests = str(gold_answer or "")
+        if not code.strip() or not tests.strip():
+            return False
+        return _run_child(
+            _exec_program_worker,
+            (code + "\n\n" + tests,),
+            timeout=8.0,
+        )
+
+
 class MATHOfficialVerifier(BaseVerifier):
     def __init__(self) -> None:
         super().__init__(VerifierSpec("math_official_tester", base_cost_vector=(0.01, 1.5, 3.0, 0.0, 0.0, 0.0)))
@@ -136,17 +170,14 @@ class MATHOfficialVerifier(BaseVerifier):
             return False
         if candidate.lower() == gold.lower():
             return True
+        if bounded_math_verify(gold, candidate):
+            return True
+        # Conservative numeric fallback; symbolic strings require exact
+        # normalized equality rather than unsafe eval().
         try:
-            from math_verify import parse, verify
-
-            return bool(verify(parse(candidate), parse(gold)))
-        except Exception:
-            # Conservative numeric fallback; symbolic strings require exact
-            # normalized equality rather than unsafe eval().
-            try:
-                return math.isclose(float(candidate), float(gold), rel_tol=1e-9, abs_tol=1e-9)
-            except (TypeError, ValueError):
-                return candidate.lower() == gold.lower()
+            return math.isclose(float(candidate), float(gold), rel_tol=1e-9, abs_tol=1e-9)
+        except (TypeError, ValueError):
+            return False
 
 
 class FOLIOVerifier(BaseVerifier):
@@ -207,6 +238,7 @@ class VerifierManager:
         self.alpha = alpha_vector
         self.verifiers = {
             "humaneval_plus_tester": HumanEvalPlusVerifier(),
+            "mbpp_plus_tester": MBPPPlusVerifier(),
             "math_official_tester": MATHOfficialVerifier(),
             "folio_tester": FOLIOVerifier(),
             "lcb_tester": LiveCodeBenchVerifier(),

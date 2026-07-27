@@ -1,7 +1,8 @@
-"""Deterministic local dataset loaders for the PWSC experiments."""
+"""Deterministic local dataset loaders for PWSC-CI experiments."""
 
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
@@ -40,6 +41,32 @@ def _first(mapping: Dict[str, Any], *names: str, default: Any = "") -> Any:
     return default
 
 
+def _calls_from_tests(tests: Iterable[str], entry_point: str) -> List[str]:
+    """Extract only call inputs from released tests; expected outputs stay unused."""
+    observed: List[str] = []
+    seen = set()
+    for test in tests:
+        try:
+            tree = ast.parse(str(test))
+        except (SyntaxError, ValueError, TypeError):
+            continue
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == entry_point
+            ):
+                continue
+            try:
+                expression = ast.unparse(node)
+            except Exception:
+                continue
+            if expression not in seen:
+                seen.add(expression)
+                observed.append(expression)
+    return observed
+
+
 class DatasetLoader:
     def __init__(self, base_dir: str = "/data/newmodel/graphunagent/datasets") -> None:
         self.base_dir = Path(base_dir)
@@ -64,6 +91,8 @@ class DatasetLoader:
             paths = [self.base_dir / "gsm8k" / "main" / "test-00000-of-00001.parquet"]
         elif task_name == "HumanEvalPlus":
             paths = [self.base_dir / "humanevalplus" / "data" / "test-00000-of-00001-5973903632b82d40.parquet"]
+        elif task_name == "MBPPPlus":
+            paths = [self.base_dir / "mbppplus" / "data" / "test-00000-of-00001-d5781c9c51e02795.parquet"]
         elif task_name == "MATH-500":
             paths = [self.base_dir / "MATH-500" / "test.jsonl"]
         elif task_name == "FOLIO":
@@ -88,6 +117,7 @@ class DatasetLoader:
             "GSM8K": self.base_dir / "gsm8k",
             "MATH-500": self.base_dir / "MATH-500",
             "HumanEvalPlus": self.base_dir / "humanevalplus",
+            "MBPPPlus": self.base_dir / "mbppplus",
             "FOLIO": self.base_dir / "folio",
             "P-FOLIO": self.base_dir / "P-FOLIO",
             "AIME2025": self.base_dir / "AIME2025",
@@ -148,6 +178,127 @@ class DatasetLoader:
                     metadata={"entry_point": entry, "task_id": task_id},
                 )
             )
+        return self._limit(samples, limit)
+
+    @staticmethod
+    def _mbpp_public_interface(test_list: Iterable[Any]) -> Tuple[str, int, List[str]]:
+        """Infer the public function name/arity from released MBPP assertions."""
+        excluded = {
+            "all",
+            "any",
+            "bool",
+            "dict",
+            "enumerate",
+            "float",
+            "int",
+            "len",
+            "list",
+            "max",
+            "min",
+            "range",
+            "reversed",
+            "round",
+            "set",
+            "sorted",
+            "str",
+            "sum",
+            "tuple",
+            "zip",
+        }
+        calls: Dict[str, List[ast.Call]] = {}
+        fallback_calls: Dict[str, List[ast.Call]] = {}
+        tests = [str(item) for item in test_list if str(item).strip()]
+        for test in tests:
+            try:
+                tree = ast.parse(test)
+            except (SyntaxError, ValueError, TypeError):
+                continue
+            roots: List[ast.AST] = []
+            for statement in tree.body:
+                if not isinstance(statement, ast.Assert):
+                    continue
+                roots.append(
+                    statement.test.left
+                    if isinstance(statement.test, ast.Compare)
+                    else statement.test
+                )
+            for node in (node for root in roots for node in ast.walk(root)):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                ):
+                    target = fallback_calls if node.func.id in excluded else calls
+                    target.setdefault(node.func.id, []).append(node)
+        if not calls:
+            calls = fallback_calls
+        if not calls:
+            raise ValueError("MBPP+ public tests do not expose a callable interface")
+        entry_point, observed = max(
+            calls.items(), key=lambda item: (len(item[1]), item[0])
+        )
+        arities = {len(call.args) for call in observed}
+        if len(arities) != 1 or any(call.keywords for call in observed):
+            raise ValueError("MBPP+ public tests have an ambiguous function signature")
+        return entry_point, arities.pop(), tests
+
+    def load_mbppplus_test(self, limit: Optional[int] = None) -> List[TaskSample]:
+        """Load MBPP+ with a public-test-derived signature and hidden plus tests."""
+        if pd is None:
+            raise ImportError("pandas is required for MBPP+ parquet files")
+        path = self._require(
+            self.base_dir
+            / "mbppplus"
+            / "data"
+            / "test-00000-of-00001-d5781c9c51e02795.parquet"
+        )
+        frame = pd.read_parquet(path)
+        samples: List[TaskSample] = []
+        for row_index, row in frame.iterrows():
+            raw_tests = row.get("test_list", [])
+            if hasattr(raw_tests, "tolist"):
+                raw_tests = raw_tests.tolist()
+            entry_point, arity, public_tests = self._mbpp_public_interface(
+                raw_tests or []
+            )
+            description = str(row.get("prompt", "")).strip()
+            parameter_names = [f"arg{index}" for index in range(arity)]
+            prompt_lines = [f"# Task: {description}", "# Released public tests:"]
+            for test in public_tests:
+                one_line = " ".join(test.splitlines())
+                prompt_lines.append(f"# {one_line}")
+            for call in _calls_from_tests(public_tests, entry_point):
+                prompt_lines.append(f"# >>> {call}")
+            prompt_lines.extend(
+                [
+                    f"def {entry_point}({', '.join(parameter_names)}):",
+                    "    pass",
+                ]
+            )
+            prompt = "\n".join(prompt_lines)
+            full_tests = str(row.get("test", ""))
+            if not full_tests.strip():
+                raise ValueError(f"MBPP+ task {row_index} has no executable plus tests")
+            task_id = int(row.get("task_id", row_index))
+            samples.append(
+                TaskSample(
+                    sample_id=f"mbppplus_{task_id}",
+                    task_type="MBPPPlus",
+                    prompt_data={
+                        "prompt": prompt,
+                        "entry_point": entry_point,
+                        "public_test_count": len(public_tests),
+                    },
+                    raw_question=prompt,
+                    gold_answer=full_tests,
+                    metadata={
+                        "entry_point": entry_point,
+                        "task_id": task_id,
+                        "public_test_count": len(public_tests),
+                    },
+                )
+            )
+            if limit and len(samples) >= limit:
+                return samples
         return self._limit(samples, limit)
 
     def load_aime2025_split(self, limit: Optional[int] = None) -> List[TaskSample]:

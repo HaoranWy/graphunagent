@@ -1,4 +1,4 @@
-"""Development-only monotone Platt calibration for PWSC risk scores."""
+"""Optional development-only monotone calibration for PWSC-CI scores."""
 
 from __future__ import annotations
 
@@ -84,8 +84,4 @@ class DevPlattCalibrator:
         return [self.calibrate(score) for score in scores]
 
 
-# Backward-compatible import name.  Its semantics are now explicitly dev-only.
-PriorConditionedCalibrator = DevPlattCalibrator
-
-
-__all__ = ["DevPlattCalibrator", "PriorConditionedCalibrator"]
+__all__ = ["DevPlattCalibrator"]

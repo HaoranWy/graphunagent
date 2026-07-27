@@ -1,4 +1,4 @@
-"""Faithful uncertainty baselines used by the PWSC experiment."""
+"""Non-PWSC uncertainty baselines used by the PWSC-CI experiment."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ class SCSVBaselines:
 
     @staticmethod
     def calculate_mbr(kernel: np.ndarray, weights: Optional[np.ndarray] = None) -> float:
-        """Confidence-consistency/MBR risk: one minus best expected agreement."""
+        """Quality-weighted task-kernel MBR adaptation: one minus best expected agreement."""
         matrix = np.asarray(kernel, dtype=np.float64)
         if matrix.ndim != 2 or matrix.shape[0] == 0:
             return 1.0
@@ -70,6 +70,88 @@ class SCSVBaselines:
         valid = np.any(matrix > 0, axis=1)
         scores = matrix @ weights
         return float(np.clip(1.0 - np.max(scores[valid]) if np.any(valid) else 1.0, 0.0, 1.0))
+
+    @staticmethod
+    def calculate_target_consistency(
+        kernel: np.ndarray,
+        weights: Optional[np.ndarray] = None,
+        target_index: int = 0,
+    ) -> float:
+        """Leave-one-out expected dissimilarity of the evaluated response."""
+        matrix = np.asarray(kernel, dtype=np.float64)
+        if matrix.ndim != 2 or matrix.shape[0] <= 1:
+            return 0.0
+        n = matrix.shape[0]
+        if target_index < 0 or target_index >= n:
+            raise IndexError("target_index is outside the kernel")
+        mask = np.ones(n, dtype=bool)
+        mask[target_index] = False
+        if weights is None:
+            evidence_weights = np.ones(int(mask.sum()), dtype=np.float64)
+        else:
+            values = np.asarray(weights, dtype=np.float64)
+            if values.size != n:
+                raise ValueError("weights must align with the kernel")
+            evidence_weights = np.clip(values[mask], 0.0, None)
+        total = float(evidence_weights.sum())
+        if total <= 0.0:
+            return 1.0
+        evidence_weights /= total
+        dissimilarity = 1.0 - np.clip(matrix[target_index, mask], 0.0, 1.0)
+        return float(np.clip(dissimilarity @ evidence_weights, 0.0, 1.0))
+
+    @staticmethod
+    def calculate_kernel_language_entropy(kernel: np.ndarray) -> float:
+        """VNE of a unit-trace task kernel, explicitly a KLE adaptation."""
+        matrix = np.asarray(kernel, dtype=np.float64)
+        if matrix.ndim != 2 or matrix.shape[0] <= 1:
+            return 0.0
+        matrix = (matrix + matrix.T) / 2.0
+        trace = float(np.trace(matrix))
+        if trace <= 0.0:
+            return 1.0
+        density = matrix / trace
+        eigenvalues = np.linalg.eigvalsh(density)
+        if float(np.min(eigenvalues)) < -1e-8:
+            raise ValueError("KLE adaptation requires a PSD kernel")
+        eigenvalues = np.clip(eigenvalues, 0.0, None)
+        eigenvalues[eigenvalues < 1e-12] = 0.0
+        eigenvalues /= float(eigenvalues.sum())
+        entropy = -float(np.sum(eigenvalues[eigenvalues > 0] * np.log(eigenvalues[eigenvalues > 0])))
+        return float(np.clip(entropy / math.log(matrix.shape[0]), 0.0, 1.0))
+
+    @staticmethod
+    def _cocoa_diversity(kernel: np.ndarray, target_index: int = 0) -> float:
+        """Target-conditioned dissimilarity used by the CoCoA formula.
+
+        The official CoCoA implementation obtains sentence similarity from a
+        cross-encoder. The PWSC-CI cache has no cross-encoder outputs, so callers
+        must pass an explicitly documented task kernel (the current runner
+        uses its deterministic outcome/AST kernel).  Keeping this primitive in
+        the baseline module makes the substitution auditable and prevents it
+        from being mistaken for the official cross-encoder score.
+        """
+        return SCSVBaselines.calculate_target_consistency(kernel, target_index=target_index)
+
+    @staticmethod
+    def calculate_cocoa_msp(
+        token_logprobs: Sequence[Any], kernel: np.ndarray, target_index: int = 0
+    ) -> float:
+        """CoCoA-MSP formula with a cache-only task-kernel adaptation."""
+        values = SCSVBaselines._nll_values(token_logprobs)
+        if values.size == 0:
+            return 1.0
+        return float(np.sum(values) * SCSVBaselines._cocoa_diversity(kernel, target_index))
+
+    @staticmethod
+    def calculate_cocoa_ppl(
+        token_logprobs: Sequence[Any], kernel: np.ndarray, target_index: int = 0
+    ) -> float:
+        """CoCoA-PPL formula with a cache-only task-kernel adaptation."""
+        values = SCSVBaselines._nll_values(token_logprobs)
+        if values.size == 0:
+            return 1.0
+        return float(np.mean(values) * SCSVBaselines._cocoa_diversity(kernel, target_index))
 
     @staticmethod
     def calculate_self_certainty(token_logprobs: Sequence[Any], apply_ln: bool = True) -> float:
@@ -95,7 +177,7 @@ class SCSVBaselines:
 
     @staticmethod
     def calculate_inside_eigen_score(hidden_states_list: Sequence[np.ndarray]) -> float:
-        # Hidden-state methods are outside PWSC; retain a clear sentinel.
+        # Hidden-state methods are outside this PWSC-CI runner.
         return float("nan")
 
     @staticmethod

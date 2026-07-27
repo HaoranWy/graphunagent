@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("ise_flow.llm.generator")
+
+# This generation/cache contract predates the PWSC-CI-only scorer.  It is kept
+# verbatim so existing immutable caches remain replayable; proof certificates
+# are generation metadata and are not consumed by PWSC-CI scoring.
+PROOF_CARRYING_GENERATION_PROTOCOL = "proof-carrying-pc-v1"
 
 try:
     from openai import OpenAI
@@ -24,22 +29,6 @@ except ImportError:  # pragma: no cover
     tqdm = None  # type: ignore
 
 
-class ConformalSemanticObserver:
-    """Compatibility shim for old callers.
-
-    PWSC does not use token embeddings.  This shim returns an exact token
-    equality kernel so legacy imports cannot silently reintroduce a random
-    projection baseline.
-    """
-
-    def compute_conformal_similarity(self, tokens: List[str]):
-        import numpy as np
-
-        if not tokens:
-            return np.zeros((0, 0), dtype=np.float64)
-        return (np.asarray(tokens, dtype=object)[:, None] == np.asarray(tokens, dtype=object)[None, :]).astype(np.float64)
-
-
 class APIGenerator:
     def __init__(
         self,
@@ -48,18 +37,56 @@ class APIGenerator:
         base_url: str = "http://127.0.0.1:8000/v1",
         seed: int = 20260615,
         top_k_logprobs: int = 5,
+        request_timeout: float = 3600.0,
+        max_retries: int = 0,
+        stop_token_ids: Optional[Sequence[int]] = None,
+        sampling_top_k: Optional[int] = None,
     ) -> None:
         if OpenAI is None:
             raise ImportError("The openai package is required for the vLLM-compatible endpoint")
+        if request_timeout <= 0:
+            raise ValueError("request_timeout must be positive")
+        if max_retries < 0:
+            raise ValueError("max_retries must be nonnegative")
         self.model_name = model_name
         self.seed = seed
         self.base_url = base_url
         self.api_key = api_key
         self.top_k = int(top_k_logprobs)
+        self.request_timeout = float(request_timeout)
+        self.max_retries = int(max_retries)
+        self.stop_token_ids = tuple(
+            sorted({int(token_id) for token_id in (stop_token_ids or ())})
+        )
+        if any(token_id < 0 for token_id in self.stop_token_ids):
+            raise ValueError("stop_token_ids must be nonnegative integers")
+        self.sampling_top_k = (
+            None if sampling_top_k is None else int(sampling_top_k)
+        )
+        if self.sampling_top_k is not None and self.sampling_top_k < 0:
+            raise ValueError("sampling_top_k must be nonnegative")
         # Local vLLM endpoints must not inherit an unrelated corporate proxy;
         # this also keeps localhost behavior identical in CI and on a laptop.
-        http_client = httpx.Client(trust_env=False) if httpx is not None else None
-        self.client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+        timeout = (
+            httpx.Timeout(
+                self.request_timeout,
+                connect=min(30.0, self.request_timeout),
+            )
+            if httpx is not None
+            else self.request_timeout
+        )
+        http_client = (
+            httpx.Client(trust_env=False, timeout=timeout)
+            if httpx is not None
+            else None
+        )
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=self.max_retries,
+            http_client=http_client,
+        )
 
     def describe_model(self) -> Dict[str, Any]:
         """Return the exact server-side model metadata used by a run."""
@@ -76,21 +103,61 @@ class APIGenerator:
         return selected
 
     @staticmethod
+    def generation_protocol(task_type: str) -> str:
+        """Return the generation contract recorded in every cache header."""
+        return PROOF_CARRYING_GENERATION_PROTOCOL
+
+    @staticmethod
     def _system_prompt(task_type: str) -> str:
         name = str(task_type).upper()
-        if "CODE" in name or "HUMANEVAL" in name:
+        if "CODE" in name or "HUMANEVAL" in name or "MBPP" in name:
             return (
                 "Implement the requested Python program. You may reason privately, "
-                "then return the complete implementation in a single ```python``` block."
+                "then return the complete implementation in a single ```python``` block. "
+                "The executable program is the proof object; do not append a proof certificate."
             )
-        if "FOLIO" in name or "LOGIC" in name:
+        if "FOLIO" in name or "LOGIC" in name or "SMT" in name:
             return (
-                "Solve the logic problem. Explain the reasoning briefly and end with exactly "
-                "one of: True, False, Uncertain."
+                "Solve the logic problem by returning exactly one compact JSON proof certificate between "
+                "<proof_certificate> and </proof_certificate>. The object must have version "
+                "'pc-v1', domain 'logic', a nonempty steps list, final_step, and final_answer. "
+                "The final_answer field is the only answer label and must be exactly True, False, or "
+                "Uncertain as a JSON string; write no content outside the certificate tags. "
+                "Each step needs id, kind, depends_on, and claim. Kinds are premise, derivation, "
+                "and conclusion. A premise step must also give the zero-based premise_index and "
+                "quote that public premise exactly. A derivation step must give a rule name and "
+                "dependency ids. The final_step must be a conclusion whose claim equals "
+                "final_answer. Use exactly one outer JSON object with this shape, replacing the "
+                "example contents: "
+                "{\"version\":\"pc-v1\",\"domain\":\"logic\",\"steps\":["
+                "{\"id\":\"p0\",\"kind\":\"premise\",\"depends_on\":[],"
+                "\"premise_index\":0,\"claim\":\"exact public premise\"},"
+                "{\"id\":\"d1\",\"kind\":\"derivation\",\"depends_on\":[\"p0\"],"
+                "\"rule\":\"rule name\",\"claim\":\"derived claim\"},"
+                "{\"id\":\"c1\",\"kind\":\"conclusion\",\"depends_on\":[\"d1\"],"
+                "\"claim\":\"True\"}],\"final_step\":\"c1\",\"final_answer\":\"True\"}. "
+                "Every depends_on value must exactly match an earlier id; include only premises used by "
+                "the final proof ancestry. Do not emit JSONL or several adjacent JSON objects. "
+                "The certificate must be the entire response, its literal first "
+                "line must be <proof_certificate>, and its literal last line must be "
+                "</proof_certificate>. These tags are mandatory. Use valid JSON with double quotes; "
+                "never use a ```json Markdown fence."
             )
         return (
-            r"Solve the problem step by step. End with one final answer in \boxed{...} "
-            "when a mathematical answer is appropriate."
+            r"Solve the problem step by step and give the ordinary final answer in \boxed{...}. "
+            "Then append exactly one compact JSON proof certificate between "
+            "<proof_certificate> and </proof_certificate>. The object must have version "
+            "'pc-v1', domain 'math', a nonempty steps list, final_step, and final_answer. "
+            "Every step must have id, kind 'equivalence', depends_on, lhs, and rhs. Write lhs and "
+            "rhs as exact ASCII arithmetic or symbolic expressions using +, -, *, /, **, "
+            "parentheses, and standard functions such as sqrt. Each equality must be exact, not "
+            "decimal approximation. Every id, dependency id, lhs, rhs, final_step, and final_answer "
+            "must be a double-quoted JSON string, even when it contains only a number; never place "
+            "an unquoted arithmetic expression in JSON. The final step rhs must equal final_answer, which must match "
+            r"the boxed answer. The certificate must be the final response content, its literal first "
+            "line must be <proof_certificate>, and its literal last line must be "
+            "</proof_certificate>. These tags are mandatory. Use valid JSON with double quotes; "
+            "never use a ```json Markdown fence."
         )
 
     @staticmethod
@@ -126,6 +193,7 @@ class APIGenerator:
         prompts: List[str],
         num_samples: int = 3,
         temperature: float = 0.7,
+        top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
         max_workers: int = 32,
         task_type: str = "GSM8K",
@@ -134,6 +202,8 @@ class APIGenerator:
             return []
         if num_samples < 1:
             raise ValueError("num_samples must be positive")
+        if top_p is not None and not 0.0 < float(top_p) <= 1.0:
+            raise ValueError("top_p must lie in (0, 1]")
         system_content = self._system_prompt(task_type)
         results: List[Optional[List[Dict[str, Any]]]] = [None] * len(prompts)
 
@@ -150,8 +220,19 @@ class APIGenerator:
                 "logprobs": True,
                 "top_logprobs": self.top_k,
             }
+            if top_p is not None:
+                request["top_p"] = float(top_p)
             if max_tokens is not None:
                 request["max_tokens"] = max_tokens
+            vllm_extensions: Dict[str, Any] = {}
+            if self.stop_token_ids:
+                # vLLM exposes this field as an OpenAI-compatible extension;
+                # extra_body keeps it out of the strict SDK request schema.
+                vllm_extensions["stop_token_ids"] = list(self.stop_token_ids)
+            if self.sampling_top_k is not None:
+                vllm_extensions["top_k"] = self.sampling_top_k
+            if vllm_extensions:
+                request["extra_body"] = vllm_extensions
             try:
                 response = self.client.chat.completions.create(**request)
                 samples = [self._choice_to_sample(choice) for choice in (response.choices or [])]
@@ -181,4 +262,4 @@ class APIGenerator:
         ]
 
 
-__all__ = ["APIGenerator", "ConformalSemanticObserver"]
+__all__ = ["APIGenerator", "PROOF_CARRYING_GENERATION_PROTOCOL"]

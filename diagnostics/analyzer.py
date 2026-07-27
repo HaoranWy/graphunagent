@@ -34,11 +34,17 @@ class ScientificSignalAnalyzer:
         n_pos, n_neg = int(pos.sum()), int(neg.sum())
         if n_pos == 0 or n_neg == 0:
             return float("nan")
-        # Mann-Whitney probability with tie handling.
-        ranks = np.argsort(np.argsort(scores, kind="mergesort"), kind="mergesort").astype(float) + 1.0
-        for value in np.unique(scores):
-            indices = np.flatnonzero(scores == value)
-            ranks[indices] = (ranks[indices].min() + ranks[indices].max()) / 2.0
+        # Mann-Whitney probability with average ranks for ties. Constructing
+        # tie groups in sorted order avoids an O(n^2) equality scan inside
+        # every bootstrap replicate.
+        order = np.argsort(scores, kind="mergesort")
+        sorted_scores = scores[order]
+        starts = np.r_[0, np.flatnonzero(sorted_scores[1:] != sorted_scores[:-1]) + 1]
+        ends = np.r_[starts[1:], scores.size]
+        average_ranks = (starts + 1.0 + ends) / 2.0
+        sorted_ranks = np.repeat(average_ranks, ends - starts)
+        ranks = np.empty(scores.size, dtype=np.float64)
+        ranks[order] = sorted_ranks
         u = float(ranks[pos].sum() - n_pos * (n_pos + 1) / 2.0)
         return u / (n_pos * n_neg)
 

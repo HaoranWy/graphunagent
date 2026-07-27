@@ -1,4 +1,4 @@
-"""Task adapters used by PWSC.
+"""Task adapters used by PWSC-CI.
 
 The adapter is deliberately small and deterministic.  It owns only answer
 canonicalisation, validity checks, and the feature map used by the consensus
@@ -10,15 +10,48 @@ from __future__ import annotations
 import ast
 import math
 import re
+import signal
+import threading
+import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 
-_CODE_TASKS = {"CODE", "HUMANEVALPLUS", "LIVECODEBENCH", "HUMANEVAL"}
+_CODE_TASKS = {
+    "CODE",
+    "HUMANEVALPLUS",
+    "LIVECODEBENCH",
+    "HUMANEVAL",
+    "MBPPPLUS",
+}
 _LOGIC_TASKS = {"FOLIO", "P-FOLIO", "PFOLIO", "SMT"}
 _MATH_TASKS = {"GSM8K", "MATH", "MATH-500", "AIME", "AIME2025", "AIME2026"}
+_PROOF_CERTIFICATE_BLOCK_RE = re.compile(
+    r"<proof_certificate\b[^>]*>.*?(?:</proof_certificate\s*>|$)",
+    flags=re.I | re.S,
+)
+_PROOF_CERTIFICATE_CLOSE_RE = re.compile(r"</proof_certificate\s*>", flags=re.I)
+_MAX_MATH_EQUIVALENCE_CHARS = 256
+_MATH_EQUIVALENCE_TIMEOUT_SECONDS = 0.5
+_MATH_EQUIVALENCE_STATS = {
+    "attempted_pair_count": 0,
+    "rejected_pair_count": 0,
+    "timeout_count": 0,
+    "failure_count": 0,
+}
+_OFFICIAL_MATH_VERIFIER_STATS = {
+    "attempted_pair_count": 0,
+    "rejected_pair_count": 0,
+    "timeout_count": 0,
+    "failure_count": 0,
+}
+
+
+class _MathEquivalenceTimeout(TimeoutError):
+    pass
 
 
 def _task_family(schema_name: str) -> str:
@@ -73,7 +106,8 @@ def canonical_logic_label(text: str) -> str:
 
 def canonical_math_answer(text: str) -> str:
     """Create a conservative string key for a mathematical final answer."""
-    raw = str(text or "")
+    raw = _PROOF_CERTIFICATE_BLOCK_RE.sub("", str(text or ""))
+    raw = _PROOF_CERTIFICATE_CLOSE_RE.sub("", raw)
     value = extract_last_boxed(raw)
     if value is None:
         answer_matches = re.findall(
@@ -170,16 +204,127 @@ def _entry_point_present(text: str, entry_point: str) -> bool:
     )
 
 
-def _math_equivalent(left: str, right: str) -> bool:
-    """Best-effort semantic equality used only to group sampled answers."""
-    if left == right:
-        return True
+def _bounded_math_key(value: str) -> bool:
+    if not value or value == "unknown" or len(value) > _MAX_MATH_EQUIVALENCE_CHARS:
+        return False
+    if "<" in value or ">" in value or "proof_certificate" in value.lower():
+        return False
+    if "\\" not in value and re.search(r"[A-Za-z]{16,}", value):
+        return False
+    return True
+
+
+def _run_bounded_math_verify(
+    gold: str,
+    target: str,
+    stats: Dict[str, int],
+) -> bool:
+    if not _bounded_math_key(gold) or not _bounded_math_key(target):
+        stats["rejected_pair_count"] += 1
+        return False
     try:
         from math_verify import parse, verify
 
-        return bool(verify(parse(left), parse(right)))
-    except Exception:
+        if (
+            threading.current_thread() is not threading.main_thread()
+            or not hasattr(signal, "setitimer")
+        ):
+            stats["rejected_pair_count"] += 1
+            return False
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
+        started = time.monotonic()
+
+        def timeout_handler(_signum: int, _frame: Any) -> None:
+            raise _MathEquivalenceTimeout
+
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.setitimer(signal.ITIMER_REAL, _MATH_EQUIVALENCE_TIMEOUT_SECONDS)
+        try:
+            # Disable math_verify's nested signal timers: they would replace
+            # this stricter end-to-end deadline rather than compose with it.
+            parsed_gold = parse(gold, parsing_timeout=None)
+            parsed_target = parse(target, parsing_timeout=None)
+            return bool(verify(parsed_gold, parsed_target, timeout_seconds=None))
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            if previous_timer[0] > 0.0:
+                elapsed = time.monotonic() - started
+                signal.setitimer(
+                    signal.ITIMER_REAL,
+                    max(previous_timer[0] - elapsed, 1e-6),
+                    previous_timer[1],
+                )
+    except _MathEquivalenceTimeout:
+        stats["timeout_count"] += 1
         return False
+    except Exception:
+        stats["failure_count"] += 1
+        return False
+
+
+@lru_cache(maxsize=65536)
+def _math_equivalent_cached(left: str, right: str) -> bool:
+    _MATH_EQUIVALENCE_STATS["attempted_pair_count"] += 1
+    return _run_bounded_math_verify(left, right, _MATH_EQUIVALENCE_STATS)
+
+
+@lru_cache(maxsize=65536)
+def _official_math_verify_cached(gold: str, target: str) -> bool:
+    _OFFICIAL_MATH_VERIFIER_STATS["attempted_pair_count"] += 1
+    return _run_bounded_math_verify(gold, target, _OFFICIAL_MATH_VERIFIER_STATS)
+
+
+def bounded_math_equivalent(left: str, right: str) -> bool:
+    """Return fail-closed semantic equality under the shared runtime bound.
+
+    Inputs are canonical answer keys.  The helper is shared by gold-free
+    answer grouping and the label-only official MATH verifier so no
+    ``math_verify`` call in the paper runner can bypass the safety policy.
+    """
+    if left == right:
+        return True
+    first, second = sorted((str(left), str(right)))
+    return _math_equivalent_cached(first, second)
+
+
+def bounded_math_verify(gold: str, target: str) -> bool:
+    """Verify a prediction against gold with bounded official orientation."""
+    reference, prediction = str(gold), str(target)
+    if reference == prediction:
+        return True
+    return _official_math_verify_cached(reference, prediction)
+
+
+def _math_equivalent(left: str, right: str) -> bool:
+    """Compatibility wrapper for internal callers and older tests."""
+    return bounded_math_equivalent(left, right)
+
+
+def math_equivalence_runtime_diagnostics() -> Dict[str, Any]:
+    cache = _math_equivalent_cached.cache_info()
+    return {
+        **_MATH_EQUIVALENCE_STATS,
+        "timeout_seconds": _MATH_EQUIVALENCE_TIMEOUT_SECONDS,
+        "max_expression_chars": _MAX_MATH_EQUIVALENCE_CHARS,
+        "cache_hits": int(cache.hits),
+        "cache_misses": int(cache.misses),
+        "cache_size": int(cache.currsize),
+    }
+
+
+def official_math_verifier_runtime_diagnostics() -> Dict[str, Any]:
+    cache = _official_math_verify_cached.cache_info()
+    return {
+        **_OFFICIAL_MATH_VERIFIER_STATS,
+        "timeout_seconds": _MATH_EQUIVALENCE_TIMEOUT_SECONDS,
+        "max_expression_chars": _MAX_MATH_EQUIVALENCE_CHARS,
+        "cache_hits": int(cache.hits),
+        "cache_misses": int(cache.misses),
+        "cache_size": int(cache.currsize),
+        "orientation": "gold_to_target",
+    }
 
 
 def transitive_classes(keys: Sequence[str], semantic: bool = False) -> List[int]:
@@ -230,6 +375,30 @@ class TaskAdapter:
             return [canonical_math_answer(text) for text in texts]
         return [re.sub(r"\s+", " ", str(text or "").strip().lower()) for text in texts]
 
+    def semantic_class_keys(
+        self,
+        texts: Sequence[str],
+        valid_mask: Optional[np.ndarray] = None,
+    ) -> List[str]:
+        """Return equivalence keys shared by PWSC-CI and discrete baselines.
+
+        Math equivalence may be stronger than conservative string
+        canonicalisation, so exposing these class keys prevents Semantic
+        Entropy and Self-Consistency from being evaluated with a weaker
+        grouping than the PWSC-CI kernel. Code keeps its normalized AST key
+        because the continuous AST kernel is not an equivalence relation.
+        """
+        raw_keys = self.outcome_keys(texts)
+        if self.family not in {"math", "logic"}:
+            return raw_keys
+        classes = transitive_classes(raw_keys, semantic=self.family == "math")
+        valid = (
+            np.asarray(valid_mask, dtype=bool)
+            if valid_mask is not None
+            else np.ones(len(raw_keys), dtype=bool)
+        )
+        return [f"class:{cls}" if valid[idx] else f"invalid:{idx}" for idx, cls in enumerate(classes)]
+
     def valid_mask(self, texts: Sequence[str]) -> np.ndarray:
         mask = np.ones(len(texts), dtype=bool)
         for idx, text in enumerate(texts):
@@ -267,12 +436,16 @@ def make_adapter(schema_name: str, metadata: Optional[Sequence[Optional[Dict[str
 
 __all__ = [
     "TaskAdapter",
+    "bounded_math_equivalent",
+    "bounded_math_verify",
     "canonical_logic_label",
     "canonical_math_answer",
     "code_ast_feature",
     "extract_last_boxed",
     "extract_python_code",
+    "math_equivalence_runtime_diagnostics",
     "make_adapter",
     "normalized_code_key",
+    "official_math_verifier_runtime_diagnostics",
     "transitive_classes",
 ]
